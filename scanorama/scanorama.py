@@ -1,6 +1,7 @@
 from annoy import AnnoyIndex
 from intervaltree import IntervalTree
 from itertools import cycle, islice
+import anndata as ad
 import numpy as np
 import operator
 import random
@@ -12,6 +13,8 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 import sys
 import warnings
+from typing import Optional
+from scipy.spatial.distance import cdist
 
 from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
@@ -110,10 +113,11 @@ def correct(datasets_full, genes_list, return_dimred=False,
     return datasets, genes
 
 # Integrate a list of data sets.
-def integrate(datasets_full, genes_list, batch_size=BATCH_SIZE,
+def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
               verbose=VERBOSE, ds_names=None, dimred=DIMRED, approx=APPROX,
               sigma=SIGMA, alpha=ALPHA, knn=KNN, union=False, hvg=None, seed=0,
-              sketch=False, sketch_method='geosketch', sketch_max=10000,):
+              sketch=False, sketch_method='geosketch', sketch_max=10000,
+              type_similarity_matrix=None, batch_key=Optional[str]):
     """Integrate a list of data sets.
 
     Parameters
@@ -165,26 +169,40 @@ def integrate(datasets_full, genes_list, batch_size=BATCH_SIZE,
     np.random.seed(seed)
     random.seed(seed)
 
+    if len(datasets_full) != len(cell_types_list):
+        raise ValueError("Number of datasets must match number of cell type lists")
+
+    if type_similarity_matrix is None:
+        print("Warning: No type similarity matrix provided. Using default equal weights.")
+        unique_types = set(type for types in cell_types_list for type in types)
+        type_similarity_matrix = np.ones((len(unique_types), len(unique_types)))
+
     datasets_full = check_datasets(datasets_full)
 
+    print('Checking datasets...')
     datasets, genes = merge_datasets(datasets_full, genes_list,
-                                     ds_names=ds_names, union=union)
+                                    ds_names=ds_names, union=union)
+    cell_types = [np.array(types) for types in cell_types_list]
+
     datasets_dimred, genes = process_data(datasets, genes, hvg=hvg,
-                                          dimred=dimred)
+                                        dimred=dimred)
 
     if sketch:
+        print('Applying sketching-based acceleration...')
         datasets_dimred = integrate_sketch(
-            datasets_dimred, sketch_method=sketch_method, N=sketch_max,
+            datasets_dimred, cell_types, type_similarity_matrix,
+            sketch_method=sketch_method, N=sketch_max,
             integration_fn=assemble, integration_fn_args={
                 'verbose': verbose, 'knn': knn, 'sigma': sigma,
                 'approx': approx, 'alpha': alpha, 'ds_names': ds_names,
                 'batch_size': batch_size,
-            },
+            }
         )
-
     else:
         datasets_dimred = assemble(
-            datasets_dimred, # Assemble in low dimensional space.
+            datasets_dimred,
+            cell_types,
+            type_similarity_matrix,
             verbose=verbose, knn=knn, sigma=sigma, approx=approx,
             alpha=alpha, ds_names=ds_names, batch_size=batch_size,
         )
@@ -274,9 +292,13 @@ def integrate_scanpy(adatas, **kwargs):
     -------
     None
     """
+    print('Integrating {} datasets...'.format(len(adatas)))
+    cell_types_list = [adata.obs['cell_type'].values for adata in adatas]
+    
     datasets_dimred, genes = integrate(
         [adata.X for adata in adatas],
         [adata.var_names.values for adata in adatas],
+        cell_types_list,
         **kwargs
     )
 
@@ -500,18 +522,29 @@ def visualize(assembled, labels, namespace, data_names,
 
     return embedding
 
-# Exact nearest neighbors search.
-def nn(ds1, ds2, knn=KNN, metric_p=2):
-    # Find nearest neighbors of first dataset.
-    nn_ = NearestNeighbors(n_neighbors=knn, p=metric_p)
-    nn_.fit(ds2)
-    ind = nn_.kneighbors(ds1, return_distance=False)
-
+def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN):
+    def weighted_distance_matrix(X1, X2, types1, types2):
+        # 计算欧氏距离矩阵
+        euclidean_dist = cdist(X1, X2, metric='euclidean')
+        
+        # 计算类型相似性矩阵
+        type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
+        type_sim = np.array([[type_sim_dict[t1][t2] for t2 in types2] for t1 in types1])
+        
+        # 应用类型相似性权重
+        weighted_dist = euclidean_dist / type_sim
+        
+        return weighted_dist
+    
+    # 计算加权距离矩阵
+    dist_matrix = weighted_distance_matrix(ds1, ds2, ds1_types, ds2_types)
+    
+    # 对每个点找到k个最近邻
+    nearest_neighbors = np.argsort(dist_matrix, axis=1)[:, :knn]
     match = set()
-    for a, b in zip(range(ds1.shape[0]), ind):
-        for b_i in b:
-            match.add((a, b_i))
-
+    for d, neighbors in enumerate(nearest_neighbors):
+        for r in neighbors:
+            match.add((d, r))
     return match
 
 # Approximate nearest neighbors using locality sensitive hashing.
@@ -536,23 +569,18 @@ def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
 
     return match
 
-# Find mutual nearest neighbors.
-def mnn(ds1, ds2, knn=KNN, approx=APPROX):
-    # Find nearest neighbors in first direction.
+def mnn(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, approx=APPROX):
     if approx:
-        match1 = nn_approx(ds1, ds2, knn=knn)
+        match1 = nn_approx_with_type(ds1, ds2, ds1_types, ds2_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
     else:
-        match1 = nn(ds1, ds2, knn=knn)
-
-    # Find nearest neighbors in second direction.
+        match1 = nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+    
     if approx:
-        match2 = nn_approx(ds2, ds1, knn=knn)
+        match2 = nn_approx_with_type(ds2, ds1, ds2_types, ds1_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
     else:
-        match2 = nn(ds2, ds1, knn=knn)
-
-    # Compute mutual nearest neighbors.
-    mutual = match1 & set([ (b, a) for a, b in match2 ])
-
+        match2 = nn_with_type(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+    
+    mutual = match1 & set([(b, a) for a, b in match2])
     return mutual
 
 # Visualize alignment between two datasets.
@@ -583,13 +611,14 @@ def plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind):
 
 # Populate a table (in place) that stores mutual nearest neighbors
 # between datasets.
-def fill_table(table, i, curr_ds, datasets, base_ds=0,
-               knn=KNN, approx=APPROX):
+def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_similarity_matrix,
+               base_ds=0, knn=KNN, approx=APPROX):
     curr_ref = np.concatenate(datasets)
+    ref_types = np.concatenate(datasets_types)
     if approx:
-        match = nn_approx(curr_ds, curr_ref, knn=knn)
+        match = nn_approx_with_type(curr_ds, curr_ref, curr_types, ref_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
     else:
-        match = nn(curr_ds, curr_ref, knn=knn, metric_p=1)
+        match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
 
     # Build interval tree.
     itree_ds_idx = IntervalTree()
@@ -617,7 +646,7 @@ def fill_table(table, i, curr_ds, datasets, base_ds=0,
 gs_idxs = None
 
 # Fill table of alignment scores.
-def find_alignments_table(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
+def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE,
                           prenormalized=False):
     if not prenormalized:
         datasets = [ normalize(ds, axis=1) for ds in datasets ]
@@ -625,11 +654,11 @@ def find_alignments_table(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
     table = {}
     for i in range(len(datasets)):
         if len(datasets[:i]) > 0:
-            fill_table(table, i, datasets[i], datasets[:i], knn=knn,
-                       approx=approx)
+            fill_table(table, i, datasets[i], datasets[:i], cell_types[i], cell_types[:i],
+                       type_similarity_matrix, knn=knn, approx=approx)
         if len(datasets[i+1:]) > 0:
-            fill_table(table, i, datasets[i], datasets[i+1:],
-                       knn=knn, base_ds=i+1, approx=approx)
+            fill_table(table, i, datasets[i], datasets[i+1:], cell_types[i], cell_types[i+1:],
+                       type_similarity_matrix, knn=knn, base_ds=i+1, approx=approx)
     # Count all mutual nearest neighbors between datasets.
     matches = {}
     table1 = {}
@@ -661,10 +690,11 @@ def find_alignments_table(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
         return table1, None, matches
 
 # Find the matching pairs of cells between datasets.
-def find_alignments(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
-                    alpha=ALPHA, prenormalized=False,):
+def find_alignments(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE,
+                    alpha=ALPHA, prenormalized=False):
     table1, _, matches = find_alignments_table(
-        datasets, knn=knn, approx=approx, verbose=verbose,
+        datasets, cell_types, type_similarity_matrix,
+        knn=knn, approx=approx, verbose=verbose,
         prenormalized=prenormalized,
     )
 
@@ -782,7 +812,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=SIGMA, cn=False,
 # Finds alignments between datasets and uses them to construct
 # panoramas. "Merges" datasets by correcting gene expression
 # values.
-def assemble(datasets, verbose=VERBOSE, view_match=False, knn=KNN,
+def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view_match=False, knn=KNN,
              sigma=SIGMA, approx=APPROX, alpha=ALPHA, expr_datasets=None,
              ds_names=None, batch_size=None,
              alignments=None, matches=None):
@@ -791,7 +821,8 @@ def assemble(datasets, verbose=VERBOSE, view_match=False, knn=KNN,
 
     if alignments is None and matches is None:
         alignments, matches = find_alignments(
-            datasets, knn=knn, approx=approx, alpha=alpha, verbose=verbose,
+            datasets, cell_types, type_similarity_matrix,
+            knn=knn, approx=approx, alpha=alpha, verbose=verbose,
         )
 
     ds_assembled = {}
@@ -829,18 +860,22 @@ def assemble(datasets, verbose=VERBOSE, view_match=False, knn=KNN,
             panoramas_i = [ panoramas[-1] ]
 
         # Map dataset i to panorama j.
+        
         if len(panoramas_i) == 0:
             curr_ds = datasets[i]
-            curr_ref = np.concatenate([ datasets[p] for p in panoramas_j[0] ])
-
+            curr_ref = np.concatenate([datasets[p] for p in panoramas_j[0]])
+            curr_types = cell_types[i]
+            ref_types = np.concatenate([cell_types[p] for p in panoramas_j[0]])
+            
             match = []
             base = 0
             for p in panoramas_j[0]:
                 if i < p and (i, p) in matches:
-                    match.extend([ (a, b + base) for a, b in matches[(i, p)] ])
+                    match.extend([(a, b + base) for a, b in matches[(i, p)]])
                 elif i > p and (p, i) in matches:
-                    match.extend([ (b, a + base) for a, b in matches[(p, i)] ])
+                    match.extend([(b, a + base) for a, b in matches[(p, i)]])
                 base += datasets[p].shape[0]
+                
 
             ds_ind = [ a for a, _ in match ]
             ref_ind = [ b for _, b in match ]
@@ -965,26 +1000,45 @@ def assemble(datasets, verbose=VERBOSE, view_match=False, knn=KNN,
     return datasets
 
 # Sketch-based acceleration of integration.
-def integrate_sketch(datasets_dimred, sketch_method='geosketch', N=10000,
+def integrate_sketch(datasets_dimred, cell_types, type_similarity_matrix, 
+                     sketch_method='geosketch', N=10000, batch_key=None, orginal_datasets=None,
                      integration_fn=assemble, integration_fn_args={}):
 
     from geosketch import gs, uniform
 
     if sketch_method.lower() == 'geosketch' or sketch_method.lower() == 'gs':
         sampling_fn = gs
+    if sketch_method.lower() == 'by_cell_type':
+        print('Using by_cell_type sketch method')
+        if batch_key is None or orginal_datasets is None:
+            raise ValueError('batch_key and orginal_datasets must be provided for by_cell_type sketch method')
+        sampling_fn = uniform_sample_by_cell_type
     else:
         sampling_fn = uniform
 
+    
     # Sketch each dataset.
-    sketch_idxs = [
-        sorted(set(sampling_fn(X, N, replace=False)))
-        if X.shape[0] > N else list(range(X.shape[0]))
-        for X in datasets_dimred
-    ]
+    if sketch_method.lower() != 'by_cell_type':
+        sketch_idxs = [
+            sorted(set(sampling_fn(X, N, replace=False)))
+            if X.shape[0] > N else list(range(X.shape[0]))
+            for X in datasets_dimred
+        ]
+    else:
+        sketch_idxs = [
+            sorted(set(sampling_fn(X, N, adata, batch_key)))
+            if X.shape[0] > N else list(range(X.shape[0]))
+            for X, adata in zip(datasets_dimred, orginal_datasets)
+        ]
     datasets_sketch = [ X[idx] for X, idx in zip(datasets_dimred, sketch_idxs) ]
 
     # Integrate the dataset sketches.
-    datasets_int = integration_fn(datasets_sketch[:], **integration_fn_args)
+    datasets_int = integration_fn(
+        datasets_sketch[:],
+        [cell_types[i][idx] for i, idx in enumerate(sketch_idxs)],
+        type_similarity_matrix,
+        **integration_fn_args
+    )
 
     # Apply integrated coordinates back to full data.
     for i, (X_dimred, X_sketch) in enumerate(zip(datasets_dimred, datasets_sketch)):
@@ -1030,3 +1084,66 @@ def assemble_accum(datasets, verbose=VERBOSE, knn=KNN, sigma=SIGMA,
         datasets[j] = ds1 + bias
 
     return datasets
+
+def uniform_sample_by_cell_type(X, N, adata, batch_key):
+    """
+    根据 adata.obs[batch_key] 的值，从每个 batch_key 中抽取尽量均等的样本，总共抽取 N 个样本。
+
+    参数:
+    X: 数据矩阵
+    N: 总共要抽取的样本数量
+    adata: AnnData 对象
+    batch_key: 用于分组的键
+
+    返回:
+    抽取的样本索引
+    """
+    # 确保 adata 中包含 batch_key
+    if batch_key not in adata.obs.columns:
+        raise ValueError(f"batch_key '{batch_key}' not found in adata.obs")
+
+    # 获取 batch_key 的唯一值
+    batches = adata.obs[batch_key].unique()
+
+    # 计算每个 batch 的样本数量
+    batch_counts = adata.obs[batch_key].value_counts()
+
+    # 按照样本数量由小到大排序
+    sorted_batches = batch_counts.sort_values().index
+
+    # 初始化抽取的样本索引列表
+    sampled_indices = []
+
+    # 计算每个 batch 应该抽取的样本数量
+    total_batches = len(sorted_batches)
+    samples_per_batch = N // total_batches
+    remainder = N % total_batches
+
+    # 初始化缺口
+    deficit = 0
+
+    # 遍历每个 batch_key
+    for i, batch in enumerate(sorted_batches):
+        # 获取当前 batch 的索引
+        batch_indices = adata.obs[adata.obs[batch_key] == batch].reset_index().index
+        
+        # 计算当前 batch 应该抽取的样本数量
+        if i < remainder:
+            batch_samples = samples_per_batch + 1 + deficit // (total_batches - i)
+        else:
+            batch_samples = samples_per_batch + deficit // (total_batches - i)
+
+        # 如果当前 batch 的样本数量小于应抽取的数量，则抽取所有样本并计算缺口
+        if len(batch_indices) < batch_samples:
+            sampled_indices.extend(batch_indices)
+            deficit += batch_samples - len(batch_indices)
+        else:
+            # 否则，随机抽取 batch_samples 个样本
+            sampled_indices.extend(np.random.choice(batch_indices, size=batch_samples, replace=False))
+            deficit = 0
+
+    # 如果总的抽取数量超过了 N，则随机抽取 N 个样本
+    if len(sampled_indices) > N:
+        sampled_indices = np.random.choice(sampled_indices, size=N, replace=False)
+
+    return sampled_indices

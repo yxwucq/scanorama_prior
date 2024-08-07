@@ -1,3 +1,5 @@
+import sys
+sys.path.append('/home/wu/datb1/AutoExtractSingleCell/scanorama')
 import scanorama
 import numpy as np
 
@@ -7,8 +9,11 @@ def data_gen():
 
     X2 = np.random.rand(200, 12)
     genes2 = list(reversed([ 'g' + str(i) for i in range(12) ]))
+    
+    X3 = np.random.rand(150, 15)
+    genes3 = [ 'g' + str(i) for i in range(15) ]
 
-    return [ X1, X2 ], [ genes1, genes2 ]
+    return [ X1, X2, X3 ], [ genes1, genes2, genes3 ]
 
 def test_scanorama_integrate():
     """
@@ -75,3 +80,7 @@ def test_scanorama_correct_scanpy():
         assert(adata_cor.X.shape[1] == adatas[0].X.shape[1])
         assert(list(adata_cor.obs['obs1']) == list(adata_orig.obs['obs1']))
         assert(list(adata_cor.var['var1']) == list(adatas[0].var['var1']))
+
+if __name__ == '__main__':
+    test_scanorama_integrate()
+    
