@@ -807,7 +807,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=SIGMA, cn=False,
     if cn:
         avg_bias = csr_matrix(avg_bias)
 
-    return avg_bias
+    return avg_bias*1.1
 
 # Finds alignments between datasets and uses them to construct
 # panoramas. "Merges" datasets by correcting gene expression
@@ -842,7 +842,7 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
         if not j in ds_assembled:
             ds_assembled[j] = 0
         ds_assembled[j] += 1
-        if ds_assembled[i] > 3 and ds_assembled[j] > 3:
+        if ds_assembled[i] > 4 and ds_assembled[j] > 4:
             continue
 
         # See if datasets are involved in any current panoramas.
