@@ -20,17 +20,19 @@ from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
 from .utils import handle_zeros_in_scale
 
+print('scanorama.scanorama loaded')
 # Default parameters.
 ALPHA = 0.10
 APPROX = True
 BATCH_SIZE = 5000
 DIMRED = 100
 HVG = None
-KNN = 20
+KNN = 30
 N_ITER = 500
 PERPLEXITY = 1200
 SIGMA = 15
 VERBOSE = 2
+OVERBIAS = 0.1
 
 # Do batch correction on a list of data sets.
 def correct(datasets_full, genes_list, return_dimred=False,
@@ -748,10 +750,12 @@ def connect(datasets, knn=KNN, approx=APPROX, alpha=ALPHA,
     return panoramas
 
 # To reduce memory usage, split bias computation into batches.
-def batch_bias(curr_ds, match_ds, bias, batch_size=None, sigma=SIGMA):
+def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_similarity_matrix, sigma=SIGMA, batch_size=None, alpha=0.1):
     if batch_size is None:
         weights = rbf_kernel(curr_ds, match_ds, gamma=0.5*sigma)
-        weights = normalize(weights, axis=1, norm='l1')
+        type_weights = compute_type_weights(curr_types, match_cell_types, type_similarity_matrix)
+        weights = weights * type_weights # curr*match
+        weights = normalize(weights, axis=1, norm='l2')
         avg_bias = np.dot(weights, bias)
         return avg_bias
 
@@ -764,22 +768,52 @@ def batch_bias(curr_ds, match_ds, bias, batch_size=None, sigma=SIGMA):
         )
         weights = rbf_kernel(curr_ds, match_ds[batch_idx, :],
                              gamma=0.5*sigma)
+        type_weights = compute_type_weights(curr_types, match_cell_types[batch_idx], type_similarity_matrix)
+        weights = weights * type_weights 
         avg_bias += np.dot(weights, bias[batch_idx, :])
         denom += np.sum(weights, axis=1)
         base += batch_size
 
     denom = handle_zeros_in_scale(denom, copy=False)
     avg_bias /= denom[:, np.newaxis]
+    # random perturbation to increase robustness
+    avg_bias *= (1+OVERBIAS)
+    # avg_bias += np.random.normal(0, 0.1, avg_bias.shape)
+
+    # correction_strength = compute_correction_strength(cell_types, type_similarity_matrix)
+    # avg_bias *= correction_strength[:, np.newaxis]
 
     return avg_bias
 
+def compute_type_weights(curr_types, match_cell_types, type_similarity_matrix):    
+    type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
+    type_weights = np.array([[type_sim_dict[t1][t2] for t2 in match_cell_types] for t1 in curr_types])
+    return type_weights
+
+# def compute_correction_strength(cell_types, type_similarity_matrix):
+#     unique_types = np.unique(cell_types)
+#     type_stability = np.array([np.mean(type_similarity_matrix.loc[t, :]) for t in unique_types])
+#     type_to_stability = dict(zip(unique_types, type_stability))
+    
+#     correction_strength = np.array([type_to_stability[t] for t in cell_types])
+    
+#     # Normalize correction strength
+#     correction_strength = (correction_strength - np.min(correction_strength)) / (np.max(correction_strength) - np.min(correction_strength))
+    
+#     # Adjust the range of correction strength (e.g., from 0.5 to 1)
+#     correction_strength = 0.5 + 0.5 * correction_strength
+    
+#     return correction_strength
+
 # Compute nonlinear translation vectors between dataset
 # and a reference.
-def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=SIGMA, cn=False,
-              batch_size=None):
+def transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix, sigma=SIGMA, cn=False,
+              batch_size=None, alpha=0.1):
     # Compute the matching.
     match_ds = curr_ds[ds_ind, :]
     match_ref = curr_ref[ref_ind, :]
+    match_cell_types = curr_types[ds_ind]
+    
     bias = match_ref - match_ds
     if cn:
         match_ds = match_ds.toarray()
@@ -789,8 +823,8 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=SIGMA, cn=False,
     with warnings.catch_warnings():
         warnings.filterwarnings('error', category=RuntimeWarning)
         try:
-            avg_bias = batch_bias(curr_ds, match_ds, bias, sigma=sigma,
-                                  batch_size=batch_size)
+            avg_bias = batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_similarity_matrix, 
+                                  sigma=sigma, batch_size=batch_size, alpha=alpha)  
         except RuntimeWarning:
             sys.stderr.write('WARNING: Oversmoothing detected, refusing to batch '
                              'correct, consider lowering sigma value.\n')
@@ -807,7 +841,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=SIGMA, cn=False,
     if cn:
         avg_bias = csr_matrix(avg_bias)
 
-    return avg_bias*1.1
+    return avg_bias
 
 # Finds alignments between datasets and uses them to construct
 # panoramas. "Merges" datasets by correcting gene expression
@@ -842,7 +876,7 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
         if not j in ds_assembled:
             ds_assembled[j] = 0
         ds_assembled[j] += 1
-        if ds_assembled[i] > 4 and ds_assembled[j] > 4:
+        if ds_assembled[i] > 3 and ds_assembled[j] > 3:
             continue
 
         # See if datasets are involved in any current panoramas.
@@ -880,15 +914,15 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
             ds_ind = [ a for a, _ in match ]
             ref_ind = [ b for _, b in match ]
 
-            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=sigma,
-                             batch_size=batch_size)
+            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
+                             sigma=sigma, batch_size=batch_size)
             datasets[i] = curr_ds + bias
 
             if expr_datasets:
                 curr_ds = expr_datasets[i]
                 curr_ref = vstack([ expr_datasets[p]
                                     for p in panoramas_j[0] ])
-                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind,
+                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
                                  sigma=sigma, cn=True, batch_size=batch_size)
                 expr_datasets[i] = curr_ds + bias
 
@@ -898,7 +932,9 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
         elif len(panoramas_j) == 0:
             curr_ds = datasets[j]
             curr_ref = np.concatenate([ datasets[p] for p in panoramas_i[0] ])
-
+            curr_types = cell_types[j]
+            ref_types = np.concatenate([ cell_types[p] for p in panoramas_i[0] ])
+            
             match = []
             base = 0
             for p in panoramas_i[0]:
@@ -911,16 +947,16 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
             ds_ind = [ a for a, _ in match ]
             ref_ind = [ b for _, b in match ]
 
-            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=sigma,
-                             batch_size=batch_size)
+            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
+                             sigma=sigma, batch_size=batch_size)
             datasets[j] = curr_ds + bias
 
             if expr_datasets:
                 curr_ds = expr_datasets[j]
                 curr_ref = vstack([ expr_datasets[p]
                                     for p in panoramas_i[0] ])
-                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=sigma,
-                                 cn=True, batch_size=batch_size)
+                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
+                                 sigma=sigma, cn=True, batch_size=batch_size)
                 expr_datasets[j] = curr_ds + bias
 
             panoramas_i[0].append(j)
@@ -929,7 +965,9 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
         else:
             curr_ds = np.concatenate([ datasets[p] for p in panoramas_i[0] ])
             curr_ref = np.concatenate([ datasets[p] for p in panoramas_j[0] ])
-
+            curr_types = np.concatenate([ cell_types[p] for p in panoramas_i[0] ])
+            ref_types = np.concatenate([ cell_types[p] for p in panoramas_j[0] ])
+            
             # Find base indices into each panorama.
             base_i = 0
             for p in panoramas_i[0]:
@@ -965,8 +1003,8 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
             ref_ind = [ b for _, b in match ]
 
             # Apply transformation to entire panorama.
-            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma=sigma,
-                             batch_size=batch_size)
+            bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
+                             sigma=sigma, batch_size=batch_size)
             curr_ds += bias
             base = 0
             for p in panoramas_i[0]:
@@ -979,7 +1017,7 @@ def assemble(datasets, cell_types, type_similarity_matrix, verbose=VERBOSE, view
                                    for p in panoramas_i[0] ])
                 curr_ref = vstack([ expr_datasets[p]
                                     for p in panoramas_j[0] ])
-                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind,
+                bias = transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, type_similarity_matrix,
                                  sigma=sigma, cn=True, batch_size=batch_size)
                 curr_ds += bias
                 base = 0
