@@ -33,7 +33,8 @@ N_ITER = 500
 PERPLEXITY = 1200
 SIGMA = 15
 VERBOSE = 2
-BIAS_SCALE = 0.2
+SEARCH_FACTOR = 5
+BIAS_SCALE = 0
 OVERBIAS = 0
 
 def compute_center_vectors(datasets, cell_types):
@@ -548,22 +549,16 @@ def visualize(assembled, labels, namespace, data_names,
 
 def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN):
     def weighted_distance_matrix(X1, X2, types1, types2):
-        # 计算欧氏距离矩阵
         euclidean_dist = cdist(X1, X2, metric='euclidean')
-        
-        # 计算类型相似性矩阵
+
         type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
         type_sim = np.array([[type_sim_dict[t1][t2] for t2 in types2] for t1 in types1])
-        
-        # 应用类型相似性权重
+
         weighted_dist = euclidean_dist / type_sim
-        
         return weighted_dist
     
-    # 计算加权距离矩阵
     dist_matrix = weighted_distance_matrix(ds1, ds2, ds1_types, ds2_types)
     
-    # 对每个点找到k个最近邻
     nearest_neighbors = np.argsort(dist_matrix, axis=1)[:, :knn]
     match = set()
     for d, neighbors in enumerate(nearest_neighbors):
@@ -574,6 +569,7 @@ def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN
 # Approximate nearest neighbors using locality sensitive hashing.
 def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
     # Build index.
+    warnings.warn('Approximate nearest neighbors does not incorporate cell type information in building the graph.')
     a = AnnoyIndex(ds2.shape[1], metric=metric)
     for i in range(ds2.shape[0]):
         a.add_item(i, ds2[i, :])
@@ -593,14 +589,43 @@ def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
 
     return match
 
+def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, metric='angular', n_trees=10, search_k=-1):
+    # Build index
+    a = AnnoyIndex(ds2.shape[1], metric=metric)
+    for i in range(ds2.shape[0]):
+        a.add_item(i, ds2[i, :])
+    a.build(n_trees)
+
+    type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
+    type_sim = np.array([[type_sim_dict[t1][t2] for t2 in ds2_types] for t1 in ds1_types])
+
+    # Search index and refine results
+    match = set()
+    for i in range(ds1.shape[0]):
+        # Get 5 * knn approximate nearest neighbors with distances
+        approx_nn, distances = a.get_nns_by_vector(ds1[i, :], SEARCH_FACTOR * knn, search_k=search_k, include_distances=True)
+        distances = np.array(distances)
+        approx_type_sim = np.array([type_sim[i][j] for j in approx_nn])
+        # Compute type-weighted distances
+        weighted_distances = distances / approx_type_sim
+        
+        # Get top knn
+        top_knn = sorted(zip(approx_nn, weighted_distances), key=lambda x: x[1])[:knn]          
+
+        # Add to match set
+        for j, _ in top_knn:
+            match.add((i, j))
+            
+    return match
+
 def mnn(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, approx=APPROX):
     if approx:
-        match1 = nn_approx_with_type(ds1, ds2, ds1_types, ds2_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
+        match1 = nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     else:
         match1 = nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     
     if approx:
-        match2 = nn_approx_with_type(ds2, ds1, ds2_types, ds1_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
+        match2 = nn_with_type_approx(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     else:
         match2 = nn_with_type(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     
@@ -640,7 +665,7 @@ def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_sim
     curr_ref = np.concatenate(datasets)
     ref_types = np.concatenate(datasets_types)
     if approx:
-        match = nn_approx_with_type(curr_ds, curr_ref, curr_types, ref_types, knn=knn, type_similarity_matrix=type_similarity_matrix)
+        match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     else:
         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
 
@@ -1162,62 +1187,49 @@ def assemble_accum(datasets, verbose=VERBOSE, knn=KNN, sigma=SIGMA,
 
 def uniform_sample_by_cell_type(X, N, adata, batch_key):
     """
-    根据 adata.obs[batch_key] 的值，从每个 batch_key 中抽取尽量均等的样本，总共抽取 N 个样本。
-
-    参数:
-    X: 数据矩阵
-    N: 总共要抽取的样本数量
-    adata: AnnData 对象
-    batch_key: 用于分组的键
-
-    返回:
-    抽取的样本索引
+    According to the cell type, uniformly sample N cells from adata.
+    
+    Parameters
+    ----------
+    X: np.ndarray
+        The data matrix.
+    N: int
+        The number of cells to sample.
+    adata: AnnData
+        The AnnData object. 
+    batch_key: str
+        The batch key in adata.obs.
     """
-    # 确保 adata 中包含 batch_key
+    # Check if batch_key is in adata.obs
     if batch_key not in adata.obs.columns:
         raise ValueError(f"batch_key '{batch_key}' not found in adata.obs")
 
-    # 获取 batch_key 的唯一值
+    # Get the unique cell types
     batches = adata.obs[batch_key].unique()
-
-    # 计算每个 batch 的样本数量
     batch_counts = adata.obs[batch_key].value_counts()
-
-    # 按照样本数量由小到大排序
     sorted_batches = batch_counts.sort_values().index
-
-    # 初始化抽取的样本索引列表
     sampled_indices = []
 
-    # 计算每个 batch 应该抽取的样本数量
     total_batches = len(sorted_batches)
     samples_per_batch = N // total_batches
     remainder = N % total_batches
 
-    # 初始化缺口
     deficit = 0
 
-    # 遍历每个 batch_key
     for i, batch in enumerate(sorted_batches):
-        # 获取当前 batch 的索引
         batch_indices = adata.obs[adata.obs[batch_key] == batch].reset_index().index
-        
-        # 计算当前 batch 应该抽取的样本数量
         if i < remainder:
             batch_samples = samples_per_batch + 1 + deficit // (total_batches - i)
         else:
             batch_samples = samples_per_batch + deficit // (total_batches - i)
 
-        # 如果当前 batch 的样本数量小于应抽取的数量，则抽取所有样本并计算缺口
         if len(batch_indices) < batch_samples:
             sampled_indices.extend(batch_indices)
             deficit += batch_samples - len(batch_indices)
         else:
-            # 否则，随机抽取 batch_samples 个样本
             sampled_indices.extend(np.random.choice(batch_indices, size=batch_samples, replace=False))
             deficit = 0
 
-    # 如果总的抽取数量超过了 N，则随机抽取 N 个样本
     if len(sampled_indices) > N:
         sampled_indices = np.random.choice(sampled_indices, size=N, replace=False)
 
