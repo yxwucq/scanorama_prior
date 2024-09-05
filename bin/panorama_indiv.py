@@ -1,6 +1,6 @@
 from config import data_names
 
-from scanorama import *
+from scanorama_prior import *
 from sklearn.metrics import silhouette_samples as sil
 from process import load_names, merge_datasets
 

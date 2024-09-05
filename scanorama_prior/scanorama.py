@@ -21,7 +21,7 @@ from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
 from .utils import handle_zeros_in_scale
 
-print('scanorama.scanorama loaded')
+print('scanorama_prior.scanorama loaded')
 # Default parameters.
 ALPHA = 0.10
 APPROX = True

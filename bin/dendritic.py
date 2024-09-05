@@ -1,7 +1,7 @@
 import numpy as np
 
 from process import load_names, merge_datasets
-from scanorama import process_data, find_alignments_table
+from scanorama_prior import process_data, find_alignments_table
 from time_align import time_align_correlate, time_align_visualize, time_dist
 
 NAMESPACE = 'dendritic'

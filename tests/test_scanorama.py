@@ -1,6 +1,6 @@
 import sys
 sys.path.append('/home/wu/datb1/AutoExtractSingleCell/scanorama')
-import scanorama
+import scanorama_prior
 import numpy as np
 
 def data_gen():
@@ -24,7 +24,7 @@ def test_scanorama_integrate():
 
     datasets, genes_list = data_gen()
 
-    integrated, genes = scanorama.integrate(datasets, genes_list)
+    integrated, genes = scanorama_prior.integrate(datasets, genes_list)
 
     for X_int, X_orig in zip(integrated, datasets):
         assert(X_int.shape[0] == X_orig.shape[0])
@@ -48,7 +48,7 @@ def test_scanorama_integrate_scanpy():
         adata.var = pd.DataFrame(genes_list[i], columns=[ 'var1' ])
         adatas.append(adata)
 
-    scanorama.integrate_scanpy(adatas)
+    scanorama_prior.integrate_scanpy(adatas)
 
     for adata, X in zip(adatas, datasets):
         assert(adata.obsm['X_scanorama'].shape[0] == X.shape[0])
@@ -73,7 +73,7 @@ def test_scanorama_correct_scanpy():
         adata.var_names = genes_list[i]
         adatas.append(adata)
 
-    corrected = scanorama.correct_scanpy(adatas)
+    corrected = scanorama_prior.correct_scanpy(adatas)
 
     for adata_cor, adata_orig in zip(corrected, adatas):
         assert(adata_cor.X.shape[0] == adata_orig.X.shape[0])

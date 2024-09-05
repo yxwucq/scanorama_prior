@@ -1,5 +1,5 @@
 import numpy as np
-from scanorama import *
+from scanorama_prior import *
 from sklearn.metrics import silhouette_samples as sil
 from scipy.sparse import vstack
 from sklearn.preprocessing import normalize, LabelEncoder

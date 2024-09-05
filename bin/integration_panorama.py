@@ -1,5 +1,5 @@
 from process import load_names
-from scanorama import *
+from scanorama_prior import *
 
 from time import time
 import numpy as np

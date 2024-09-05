@@ -1,5 +1,5 @@
 import numpy as np
-from scanorama import plt
+from scanorama_prior import plt
 plt.rcParams.update({'font.size': 25})
 import sys
 

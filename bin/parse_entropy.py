@@ -1,5 +1,5 @@
 import fileinput
-from scanorama import plt
+from scanorama_prior import plt
 plt.rcParams.update({'font.size': 22})
 import sys
 

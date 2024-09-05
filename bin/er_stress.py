@@ -5,8 +5,8 @@ from sklearn.preprocessing import normalize, LabelEncoder
 import sys
 
 from process import load_names
-from scanorama import correct, visualize, process_data, plt
-from scanorama import dimensionality_reduce, merge_datasets
+from scanorama_prior import correct, visualize, process_data, plt
+from scanorama_prior import dimensionality_reduce, merge_datasets
 
 NAMESPACE = 'er_stress'
 

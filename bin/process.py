@@ -6,7 +6,7 @@ from scipy.sparse import csr_matrix
 from sklearn.preprocessing import normalize
 import sys
 
-from scanorama import merge_datasets
+from scanorama_prior import merge_datasets
 
 MIN_TRANSCRIPTS = 600
 

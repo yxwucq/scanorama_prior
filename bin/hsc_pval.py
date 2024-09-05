@@ -4,7 +4,7 @@ from sklearn.preprocessing import normalize, LabelEncoder
 import sys
 
 from process import load_names
-from scanorama import *
+from scanorama_prior import *
 
 NAMESPACE = 'hsc'
 

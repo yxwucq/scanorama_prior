@@ -1,5 +1,5 @@
 import numpy as np
-from scanorama import *
+from scanorama_prior import *
 from scipy.stats import f_oneway
 from sklearn.cluster import KMeans
 import sys

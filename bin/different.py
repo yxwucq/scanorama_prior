@@ -1,5 +1,5 @@
 import numpy as np
-from scanorama import *
+from scanorama_prior import *
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import normalize
 import sys
