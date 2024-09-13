@@ -132,7 +132,7 @@ def correct(datasets_full, genes_list, return_dimred=False,
 
 # Integrate a list of data sets.
 def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
-              verbose=VERBOSE, ds_names=None, dimred=DIMRED, approx=APPROX,
+              verbose=VERBOSE, ds_names=None, dimred=DIMRED, approx=APPROX, search_factor=SEARCH_FACTOR,
               sigma=SIGMA, alpha=ALPHA, knn=KNN, union=False, hvg=None, seed=0,
               sketch=False, sketch_method='geosketch', sketch_max=10000,
               type_similarity_matrix=None, batch_key=Optional[str]):
@@ -156,6 +156,8 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
         Dimensionality of integrated embedding.
     approx: `bool`, optional (default: `True`)
         Use approximate nearest neighbors, greatly speeds up matching runtime.
+    search_factor: `int`, optional (default: 5)
+        Factor to increase search space when using approximate nearest neighbors.
     sigma: `float`, optional (default: 15)
         Correction smoothing parameter on Gaussian kernel.
     alpha: `float`, optional (default: 0.10)
@@ -219,6 +221,7 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
             integration_fn=assemble, integration_fn_args={
                 'verbose': verbose, 'knn': knn, 'sigma': sigma,
                 'approx': approx, 'alpha': alpha, 'ds_names': ds_names,
+                'search_factor': search_factor, 
                 'batch_size': batch_size,
             }
         )
@@ -228,7 +231,7 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
             cell_types,
             center_vectors,
             type_similarity_matrix,
-            verbose=verbose, knn=knn, sigma=sigma, approx=approx,
+            verbose=verbose, knn=knn, sigma=sigma, approx=approx, search_factor=search_factor,
             alpha=alpha, ds_names=ds_names, batch_size=batch_size,
         )
 
@@ -589,7 +592,7 @@ def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
 
     return match
 
-def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, metric='angular', n_trees=10, search_k=-1):
+def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, search_factor=SEARCH_FACTOR, knn=KNN, metric='angular', n_trees=10, search_k=-1):
     # Build index
     a = AnnoyIndex(ds2.shape[1], metric=metric)
     for i in range(ds2.shape[0]):
@@ -603,7 +606,7 @@ def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, 
     match = set()
     for i in range(ds1.shape[0]):
         # Get 5 * knn approximate nearest neighbors with distances
-        approx_nn, distances = a.get_nns_by_vector(ds1[i, :], SEARCH_FACTOR * knn, search_k=search_k, include_distances=True)
+        approx_nn, distances = a.get_nns_by_vector(ds1[i, :], search_factor * knn, search_k=search_k, include_distances=True)
         distances = np.array(distances)
         approx_type_sim = np.array([type_sim[i][j] for j in approx_nn])
         # Compute type-weighted distances
@@ -618,14 +621,14 @@ def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, 
             
     return match
 
-def mnn(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, approx=APPROX):
+def mnn(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
     if approx:
-        match1 = nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+        match1 = nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
     else:
         match1 = nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     
     if approx:
-        match2 = nn_with_type_approx(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+        match2 = nn_with_type_approx(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
     else:
         match2 = nn_with_type(ds2, ds1, ds2_types, ds1_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
     
@@ -661,11 +664,11 @@ def plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind):
 # Populate a table (in place) that stores mutual nearest neighbors
 # between datasets.
 def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_similarity_matrix,
-               base_ds=0, knn=KNN, approx=APPROX):
+               base_ds=0, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
     curr_ref = np.concatenate(datasets)
     ref_types = np.concatenate(datasets_types)
     if approx:
-        match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+        match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
     else:
         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
 
@@ -695,7 +698,7 @@ def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_sim
 gs_idxs = None
 
 # Fill table of alignment scores.
-def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE,
+def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE, search_factor=SEARCH_FACTOR,
                           prenormalized=False):
     if not prenormalized:
         datasets = [ normalize(ds, axis=1) for ds in datasets ]
@@ -704,10 +707,10 @@ def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN,
     for i in range(len(datasets)):
         if len(datasets[:i]) > 0:
             fill_table(table, i, datasets[i], datasets[:i], cell_types[i], cell_types[:i],
-                       type_similarity_matrix, knn=knn, approx=approx)
+                       type_similarity_matrix, knn=knn, approx=approx, search_factor=search_factor)
         if len(datasets[i+1:]) > 0:
             fill_table(table, i, datasets[i], datasets[i+1:], cell_types[i], cell_types[i+1:],
-                       type_similarity_matrix, knn=knn, base_ds=i+1, approx=approx)
+                       type_similarity_matrix, knn=knn, base_ds=i+1, approx=approx, search_factor=search_factor)
     # Count all mutual nearest neighbors between datasets.
     matches = {}
     table1 = {}
@@ -739,11 +742,11 @@ def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN,
         return table1, None, matches
 
 # Find the matching pairs of cells between datasets.
-def find_alignments(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE,
+def find_alignments(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE, search_factor=SEARCH_FACTOR,
                     alpha=ALPHA, prenormalized=False):
     table1, _, matches = find_alignments_table(
         datasets, cell_types, type_similarity_matrix,
-        knn=knn, approx=approx, verbose=verbose,
+        knn=knn, approx=approx, verbose=verbose, search_factor=search_factor,
         prenormalized=prenormalized,
     )
 
@@ -903,7 +906,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, curr_ce
 # panoramas. "Merges" datasets by correcting gene expression
 # values.
 def assemble(datasets, cell_types, center_vectors, type_similarity_matrix, verbose=VERBOSE, view_match=False, knn=KNN,
-             sigma=SIGMA, approx=APPROX, alpha=ALPHA, expr_datasets=None,
+             sigma=SIGMA, approx=APPROX, search_factor = SEARCH_FACTOR, alpha=ALPHA, expr_datasets=None,
              ds_names=None, batch_size=None,
              alignments=None, matches=None):
     if len(datasets) == 1:
@@ -912,7 +915,7 @@ def assemble(datasets, cell_types, center_vectors, type_similarity_matrix, verbo
     if alignments is None and matches is None:
         alignments, matches = find_alignments(
             datasets, cell_types, type_similarity_matrix,
-            knn=knn, approx=approx, alpha=alpha, verbose=verbose,
+            knn=knn, approx=approx, alpha=alpha, verbose=verbose, search_factor=search_factor
         )
 
     ds_assembled = {}
@@ -1161,7 +1164,7 @@ def integrate_sketch(datasets_dimred, cell_types, type_similarity_matrix,
 
 # Non-optimal dataset assembly. Simply accumulate datasets into a
 # reference.
-def assemble_accum(datasets, verbose=VERBOSE, knn=KNN, sigma=SIGMA,
+def assemble_accum(datasets, verbose=VERBOSE, knn=KNN, sigma=SIGMA, search_factor=SEARCH_FACTOR,
                    approx=APPROX, batch_size=None):
     if len(datasets) == 1:
         return datasets
@@ -1174,7 +1177,7 @@ def assemble_accum(datasets, verbose=VERBOSE, knn=KNN, sigma=SIGMA,
 
         ds1 = datasets[j]
         ds2 = np.concatenate(datasets[:i+1])
-        match = mnn(ds1, ds2, knn=knn, approx=approx)
+        match = mnn(ds1, ds2, knn=knn, approx=approx, search_factor=search_factor)
 
         ds_ind = [ a for a, _ in match ]
         ref_ind = [ b for _, b in match ]
