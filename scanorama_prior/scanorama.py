@@ -16,6 +16,7 @@ import sys
 import warnings
 from typing import Optional
 from scipy.spatial.distance import cdist
+from numba import njit, prange
 
 from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
@@ -192,17 +193,20 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
     if len(datasets_full) != len(cell_types_list):
         raise ValueError("Number of datasets must match number of cell type lists")
 
-    if type_similarity_matrix is None:
-        print("Warning: No type similarity matrix provided. Using default equal weights.")
-        unique_types = set(type for types in cell_types_list for type in types)
-        type_similarity_matrix = np.ones((len(unique_types), len(unique_types)))
-
     datasets_full = check_datasets(datasets_full)
 
     print('Checking datasets...')
     datasets, genes = merge_datasets(datasets_full, genes_list,
                                     ds_names=ds_names, union=union)
-    cell_types = [np.array(types) for types in cell_types_list]
+    
+    if type_similarity_matrix is None:
+        print("Warning: No type similarity matrix provided. Using default equal weights.")
+        unique_types = set(type for types in cell_types_list for type in types)
+        type_similarity_matrix = np.ones((len(unique_types), len(unique_types)))
+    else:
+        type_to_index = {t: i for i, t in enumerate(type_similarity_matrix.index)}
+        cell_types = [np.array(list(map(lambda x: type_to_index[x], types))) for types in cell_types_list]
+        type_similarity_matrix = type_similarity_matrix.to_numpy()
 
     datasets_dimred, genes = process_data(datasets, genes, hvg=hvg,
                                         dimred=dimred)
@@ -550,23 +554,19 @@ def visualize(assembled, labels, namespace, data_names,
 
     return embedding
 
-def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN):
-    def weighted_distance_matrix(X1, X2, types1, types2):
-        euclidean_dist = cdist(X1, X2, metric='euclidean')
+@njit
+def weighted_distance_matrix(euclidean_dist, type_sim):
+    weighted_dist = euclidean_dist / type_sim
+    return weighted_dist
 
-        type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
-        type_sim = np.array([[type_sim_dict[t1][t2] for t2 in types2] for t1 in types1])
-
-        weighted_dist = euclidean_dist / type_sim
-        return weighted_dist
+def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=5):
+    euclidean_dist = cdist(ds1, ds2, metric='euclidean')
+    type_sim = type_similarity_matrix[ds1_types[:, None], ds2_types[None, :]]
+    dist_matrix = weighted_distance_matrix(euclidean_dist, type_sim)
     
-    dist_matrix = weighted_distance_matrix(ds1, ds2, ds1_types, ds2_types)
+    nearest_neighbors = np.argpartition(dist_matrix, knn, axis=1)[:, :knn]
     
-    nearest_neighbors = np.argsort(dist_matrix, axis=1)[:, :knn]
-    match = set()
-    for d, neighbors in enumerate(nearest_neighbors):
-        for r in neighbors:
-            match.add((d, r))
+    match = set((d, r) for d, neighbors in enumerate(nearest_neighbors) for r in neighbors)
     return match
 
 # Approximate nearest neighbors using locality sensitive hashing.
@@ -599,26 +599,26 @@ def nn_with_type_approx(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, 
         a.add_item(i, ds2[i, :])
     a.build(n_trees)
 
-    type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
-    type_sim = np.array([[type_sim_dict[t1][t2] for t2 in ds2_types] for t1 in ds1_types])
-
     # Search index and refine results
-    match = set()
+
+    all_approx_nn = np.zeros((ds1.shape[0], search_factor * knn), dtype=np.int32)
+    all_approx_types = np.zeros((ds1.shape[0], search_factor * knn), dtype=np.int32)
+    all_distances = np.zeros((ds1.shape[0], search_factor * knn), dtype=np.float32)
+    
     for i in range(ds1.shape[0]):
         # Get 5 * knn approximate nearest neighbors with distances
         approx_nn, distances = a.get_nns_by_vector(ds1[i, :], search_factor * knn, search_k=search_k, include_distances=True)
-        distances = np.array(distances)
-        approx_type_sim = np.array([type_sim[i][j] for j in approx_nn])
-        # Compute type-weighted distances
-        weighted_distances = distances / approx_type_sim
-        
-        # Get top knn
-        top_knn = sorted(zip(approx_nn, weighted_distances), key=lambda x: x[1])[:knn]          
+        all_approx_nn[i, :] = np.array(approx_nn)
+        all_approx_types[i, :] = ds2_types[np.array(approx_nn)]
+        all_distances[i, :] = np.array(distances)
 
-        # Add to match set
-        for j, _ in top_knn:
-            match.add((i, j))
-            
+    approx_type_sim = type_similarity_matrix[ds1_types[:, None], all_approx_types]
+    # Compute type-weighted distances
+    dist_matrix = weighted_distance_matrix(all_distances, approx_type_sim)
+    indices = np.argpartition(dist_matrix, knn, axis=1)
+    nearest_neighbors = np.take_along_axis(all_approx_nn, indices, axis=1)[:, :knn]
+    
+    match = set((d, r) for d, neighbors in enumerate(nearest_neighbors) for r in neighbors)
     return match
 
 def mnn(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
@@ -803,7 +803,7 @@ def connect(datasets, knn=KNN, approx=APPROX, alpha=ALPHA,
 def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_similarity_matrix, sigma=SIGMA, batch_size=None, alpha=0.1):
     if batch_size is None:
         weights = rbf_kernel(curr_ds, match_ds, gamma=0.5*sigma)
-        type_weights = compute_type_weights(curr_types, match_cell_types, type_similarity_matrix)
+        type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, :]]
         weights = weights * type_weights**2 # curr*match
         weights = normalize(weights, axis=1, norm='l1')
         avg_bias = np.dot(weights, bias)
@@ -818,7 +818,7 @@ def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_simil
         )
         weights = rbf_kernel(curr_ds, match_ds[batch_idx, :],
                              gamma=0.5*sigma)
-        type_weights = compute_type_weights(curr_types, match_cell_types[batch_idx], type_similarity_matrix)
+        type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, batch_idx]]
         weights = weights * type_weights**2
         avg_bias += np.dot(weights, bias[batch_idx, :])
         denom += np.sum(weights, axis=1)
@@ -835,11 +835,6 @@ def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_simil
     # avg_bias *= correction_strength[:, np.newaxis]
 
     return avg_bias
-
-def compute_type_weights(curr_types, match_cell_types, type_similarity_matrix):    
-    type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
-    type_weights = np.array([[type_sim_dict[t1][t2] for t2 in match_cell_types] for t1 in curr_types])
-    return type_weights
 
 # def compute_correction_strength(cell_types, type_similarity_matrix):
 #     unique_types = np.unique(cell_types)
@@ -869,9 +864,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, curr_ce
     match_curr_center_vec = curr_center_vec[ds_ind, :]
     match_ref_center_vec = ref_center_vec[ref_ind, :]
 
-    type_sim_dict = {t1: {t2: type_similarity_matrix.loc[t1, t2] for t2 in type_similarity_matrix.columns} for t1 in type_similarity_matrix.index}
-    center_adjusted_weight = np.array([type_sim_dict[t1][t2] for t1, t2 in zip(match_cell_types, match_cell_types_ref)])
-
+    center_adjusted_weight = type_similarity_matrix[match_cell_types, match_cell_types_ref]
     center_adjusted_bias = (match_ref - match_ds) + center_adjusted_weight[:, np.newaxis]**2 *(match_curr_center_vec - match_ref_center_vec)
     
     if cn:
