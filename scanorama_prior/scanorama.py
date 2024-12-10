@@ -138,6 +138,48 @@ def correct(datasets_full, genes_list, return_dimred=False,
 
     return datasets, genes
 
+class DatasetIndexer:
+    """A more efficient replacement for IntervalTree using arrays and dictionaries."""
+    def __init__(self, datasets):
+        # Pre-compute cumulative sizes and dataset boundaries
+        self.dataset_sizes = [ds.shape[0] for ds in datasets]
+        self.cumulative_sizes = np.cumsum([0] + self.dataset_sizes)
+        
+        # Create quick lookup arrays
+        self.total_cells = self.cumulative_sizes[-1]
+        self.dataset_lookup = np.zeros(self.total_cells, dtype=np.int32)
+        self.local_indices = np.zeros(self.total_cells, dtype=np.int32)
+        
+        # Fill lookup arrays
+        for i in range(len(datasets)):
+            start, end = self.cumulative_sizes[i], self.cumulative_sizes[i + 1]
+            self.dataset_lookup[start:end] = i
+            self.local_indices[start:end] = np.arange(self.dataset_sizes[i])
+            
+        # Cache for frequent queries
+        self.cache = {}
+    
+    def get_dataset_index(self, global_idx):
+        """Get dataset index for a global index."""
+        if isinstance(global_idx, (list, np.ndarray)):
+            return self.dataset_lookup[global_idx]
+        return self.dataset_lookup[global_idx]
+    
+    def get_local_index(self, global_idx):
+        """Get local index within dataset for a global index."""
+        if isinstance(global_idx, (list, np.ndarray)):
+            return self.local_indices[global_idx]
+        return self.local_indices[global_idx]
+    
+    def get_global_index(self, dataset_idx, local_idx):
+        """Convert dataset index and local index to global index."""
+        return self.cumulative_sizes[dataset_idx] + local_idx
+    
+    def get_dataset_range(self, dataset_idx):
+        """Get range of global indices for a dataset."""
+        return (self.cumulative_sizes[dataset_idx], 
+                self.cumulative_sizes[dataset_idx + 1])
+
 # Integrate a list of data sets.
 def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
               verbose=VERBOSE, ds_names=None, dimred=DIMRED, approx=APPROX, search_factor=SEARCH_FACTOR,
@@ -821,37 +863,73 @@ def plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind):
 
 # Populate a table (in place) that stores mutual nearest neighbors
 # between datasets.
-def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_similarity_matrix,
-               base_ds=0, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
+def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, 
+                        type_similarity_matrix, base_ds=0, knn=30, approx=True, 
+                        search_factor=5):
+    """Optimized version of fill_table using array operations instead of IntervalTree."""
+    # Create concatenated reference dataset
     curr_ref = np.concatenate(datasets)
     ref_types = np.concatenate(datasets_types)
+    
+    # Create indexer for efficient lookups
+    indexer = DatasetIndexer(datasets)
+    
     if approx:
-        match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
+        match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, 
+                                   type_similarity_matrix, knn=knn, 
+                                   search_factor=search_factor)
     else:
-        match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+        match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, 
+                            type_similarity_matrix, knn=knn)
 
-    # Build interval tree.
-    itree_ds_idx = IntervalTree()
-    itree_pos_base = IntervalTree()
-    pos = 0
-    for j in range(len(datasets)):
-        n_cells = datasets[j].shape[0]
-        itree_ds_idx[pos:(pos + n_cells)] = base_ds + j
-        itree_pos_base[pos:(pos + n_cells)] = pos
-        pos += n_cells
-
-    # Store all mutual nearest neighbors between datasets.
+    # Process matches in batches for memory efficiency
+    matches_by_dataset = defaultdict(list)
+    
     for d, r in match:
-        interval = itree_ds_idx[r]
-        assert(len(interval) == 1)
-        j = interval.pop().data
-        interval = itree_pos_base[r]
-        assert(len(interval) == 1)
-        base = interval.pop().data
-        if not (i, j) in table:
+        # Get dataset index and local index using array operations
+        j = indexer.get_dataset_index(r)
+        local_idx = indexer.get_local_index(r)
+        
+        # Store match
+        dataset_key = (i, base_ds + j)
+        matches_by_dataset[dataset_key].append((d, local_idx))
+    
+    # Update table with batched results
+    for (i, j), matches in matches_by_dataset.items():
+        if (i, j) not in table:
             table[(i, j)] = set()
-        table[(i, j)].add((d, r - base))
-        assert(r - base >= 0)
+        table[(i, j)].update(matches)
+# def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_similarity_matrix,
+#                base_ds=0, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
+#     curr_ref = np.concatenate(datasets)
+#     ref_types = np.concatenate(datasets_types)
+#     if approx:
+#         match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
+#     else:
+#         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
+
+#     # Build interval tree.
+#     itree_ds_idx = IntervalTree()
+#     itree_pos_base = IntervalTree()
+#     pos = 0
+#     for j in range(len(datasets)):
+#         n_cells = datasets[j].shape[0]
+#         itree_ds_idx[pos:(pos + n_cells)] = base_ds + j
+#         itree_pos_base[pos:(pos + n_cells)] = pos
+#         pos += n_cells
+
+#     # Store all mutual nearest neighbors between datasets.
+#     for d, r in match:
+#         interval = itree_ds_idx[r]
+#         assert(len(interval) == 1)
+#         j = interval.pop().data
+#         interval = itree_pos_base[r]
+#         assert(len(interval) == 1)
+#         base = interval.pop().data
+#         if not (i, j) in table:
+#             table[(i, j)] = set()
+#         table[(i, j)].add((d, r - base))
+#         assert(r - base >= 0)
 
 gs_idxs = None
 
