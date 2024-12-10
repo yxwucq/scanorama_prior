@@ -1,4 +1,5 @@
 from annoy import AnnoyIndex
+from collections import defaultdict
 from intervaltree import IntervalTree
 from itertools import cycle, islice
 import anndata as ad
@@ -14,9 +15,15 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 import sys
 import warnings
-from typing import Optional
 from scipy.spatial.distance import cdist
 from numba import njit, prange
+import math
+import multiprocessing as mp
+import gc
+
+from multiprocessing import Pool, cpu_count, shared_memory
+from functools import partial
+from typing import Optional, List, Set, Tuple, Dict, Generator
 
 from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
@@ -559,14 +566,165 @@ def weighted_distance_matrix(euclidean_dist, type_sim):
     weighted_dist = euclidean_dist / type_sim
     return weighted_dist
 
-def nn_with_type(ds1, ds2, ds1_types, ds2_types, type_similarity_matrix, knn=5):
-    euclidean_dist = cdist(ds1, ds2, metric='euclidean')
-    type_sim = type_similarity_matrix[ds1_types[:, None], ds2_types[None, :]]
-    dist_matrix = weighted_distance_matrix(euclidean_dist, type_sim)
+def process_batch(batch_data: Tuple[np.ndarray, np.ndarray, int], 
+                 ds2: np.ndarray,
+                 ds2_types: np.ndarray,
+                 type_similarity_matrix: np.ndarray,
+                 label_searchers: Dict,
+                 label_indices: Dict,
+                 knn: int,
+                 threshold: float) -> Set[Tuple[int, int]]:
+    """
+    Process a batch of query points in parallel
     
-    nearest_neighbors = np.argpartition(dist_matrix, knn, axis=1)[:, :knn]
+    Args:
+        batch_data: Tuple of (batch_points, batch_types, start_idx)
+        Other args same as main function
+    """
+    batch_points, batch_types, start_idx = batch_data
+    batch_matches = set()
     
-    match = set((d, r) for d, neighbors in enumerate(nearest_neighbors) for r in neighbors)
+    for i, (query_point, query_label_idx) in enumerate(zip(batch_points, batch_types)):
+        # Get similarity scores for query label
+        label_similarities = type_similarity_matrix[query_label_idx]
+        similar_labels = np.where(label_similarities > threshold)[0]
+        
+        candidates = []
+        
+        # Search in each similar label group
+        for target_label_idx in similar_labels:
+            if target_label_idx not in label_searchers:
+                continue
+                
+            similarity = label_similarities[target_label_idx]
+            searcher = label_searchers[target_label_idx]
+            
+            dists, indices = searcher.kneighbors([query_point])
+            adjusted_dists = dists[0] / (similarity + 1e-6)
+            original_indices = [label_indices[target_label_idx][idx] for idx in indices[0]]
+            candidates.extend(zip(adjusted_dists, original_indices))
+            
+        # Adaptive threshold if not enough neighbors
+        if len(candidates) < knn:
+            threshold_temp = threshold / 2
+            while len(candidates) < knn and threshold_temp > 0.1:
+                additional_labels = np.where((label_similarities > threshold_temp) & 
+                                          (label_similarities <= threshold))[0]
+                
+                for target_label_idx in additional_labels:
+                    if target_label_idx not in label_searchers:
+                        continue
+                    similarity = label_similarities[target_label_idx]
+                    searcher = label_searchers[target_label_idx]
+                    dists, indices = searcher.kneighbors([query_point])
+                    adjusted_dists = dists[0] / similarity
+                    original_indices = [label_indices[target_label_idx][idx] for idx in indices[0]]
+                    candidates.extend(zip(adjusted_dists, original_indices))
+                threshold_temp /= 2
+                
+        # Add top k to matches
+        if candidates:
+            candidates.sort()
+            for _, idx in candidates[:knn]:
+                batch_matches.add((start_idx + i, idx))
+                
+    return batch_matches
+
+def build_searcher(label_data, knn, metric_p):
+   """
+   Helper function to build a NearestNeighbors searcher
+   
+   Args:
+       label_data: Tuple of (label_idx, points)
+       knn: Number of neighbors
+       metric_p: Distance metric parameter
+   """
+   label_idx, points = label_data
+   if len(points) > 0:
+       nn_ = NearestNeighbors(n_neighbors=min(knn, len(points)), 
+                             p=metric_p,
+                             algorithm='ball_tree')
+       nn_.fit(np.array(points))
+       return label_idx, nn_
+   return label_idx, None
+
+def nn_with_type(ds1: np.ndarray, 
+                         ds2: np.ndarray, 
+                         ds1_types: np.ndarray,
+                         ds2_types: np.ndarray,
+                         type_similarity_matrix: np.ndarray,
+                         knn: int = 5,
+                         metric_p: int = 2,
+                         threshold: float = 0.4,
+                         n_jobs: int = -1,
+                         batch_size: int = None) -> Set[Tuple[int, int]]:
+    """
+    Parallel implementation of label-aware KNN search
+    
+    Additional Args:
+        n_jobs: Number of processes to use (-1 for all available)
+        batch_size: Size of batches for parallel processing (None for auto)
+    """
+    # Handle n_jobs parameter
+    if n_jobs < 1:
+        n_jobs = max(1, cpu_count() + n_jobs) 
+    
+    # 1. Initialize searchers and indices
+    label_searchers = {}  
+    label_points = defaultdict(list)
+    label_indices = defaultdict(list)
+    
+    # Build indices mapping numeric labels to points
+    for i, (point, label_idx) in enumerate(zip(ds2, ds2_types)):
+        label_points[label_idx].append(point)
+        label_indices[label_idx].append(i)
+        
+    # Parallel tree building
+    with Pool(processes=n_jobs) as pool:
+        # Prepare data for parallel processing
+        label_data = [(label_idx, np.array(points)) 
+                        for label_idx, points in label_points.items()]
+        
+        # Create partial function with fixed parameters
+        build_searcher_partial = partial(build_searcher, 
+                                        knn=knn,
+                                        metric_p=metric_p)
+        
+        # Build trees in parallel
+        results = pool.map(build_searcher_partial, label_data)
+        
+        # Convert results to dictionary
+        label_searchers = {label_idx: searcher 
+                            for label_idx, searcher in results 
+                            if searcher is not None}
+                
+    # 2. Prepare batches for parallel processing
+    n_samples = len(ds1)
+    if batch_size is None:
+        # Aim for ~100 batches or batch_size=100, whichever gives larger batches
+        batch_size = max(100, math.ceil(n_samples / 100))
+    
+    batches = []
+    for i in range(0, n_samples, batch_size):
+        batch_points = ds1[i:i + batch_size]
+        batch_types = ds1_types[i:i + batch_size]
+        batches.append((batch_points, batch_types, i))
+    
+    # 3. Process batches in parallel
+    with Pool(processes=n_jobs) as pool:
+        process_func = partial(process_batch,
+                             ds2=ds2,
+                             ds2_types=ds2_types,
+                             type_similarity_matrix=type_similarity_matrix,
+                             label_searchers=label_searchers,
+                             label_indices=label_indices,
+                             knn=knn,
+                             threshold=threshold)
+        
+        results = pool.map(process_func, batches)
+    
+    # 4. Combine results
+    match = set().union(*results)
     return match
 
 # Approximate nearest neighbors using locality sensitive hashing.
