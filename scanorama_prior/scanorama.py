@@ -4,7 +4,9 @@ from intervaltree import IntervalTree
 from itertools import cycle, islice
 import anndata as ad
 import numpy as np
+from numba import cuda
 import operator
+from tqdm import tqdm
 import random
 import time
 import scipy
@@ -23,7 +25,7 @@ import gc
 
 from multiprocessing import Pool, cpu_count, shared_memory
 from functools import partial
-from typing import Optional, List, Set, Tuple, Dict, Generator
+from typing import Optional, List, Set, Tuple, Dict, Union, Generator
 
 from .utils import plt, dispersion, reduce_dimensionality
 from .utils import visualize_cluster, visualize_expr, visualize_dropout
@@ -44,6 +46,166 @@ VERBOSE = 2
 SEARCH_FACTOR = 5
 BIAS_SCALE = 0
 OVERBIAS = 0
+
+# GPU availability checker
+def check_gpu_availability() -> bool:
+    """
+    Check if GPU is available for computation.
+    Returns True if GPU is available, False otherwise.
+    """
+    try:
+        # Try importing cupy
+        import cupy as cp
+        
+        # Check if CUDA is available
+        if not cuda.is_available():
+            return False
+            
+        # Try to initialize CUDA device
+        cuda.get_current_device()
+        
+        # Perform a small test computation
+        test_array = cp.array([1, 2, 3])
+        test_array + test_array
+        
+        return True
+    except:
+        return False
+
+# Function selector for weighted KNN computation
+def get_weighted_knn_func(use_gpu: bool = None):
+
+    if use_gpu is None:
+        use_gpu = check_gpu_availability()
+    
+    if use_gpu:
+        try:
+            import cupy as cp
+            
+            def parallel_weighted_knn_gpu_batched(
+                query_points: np.ndarray,
+                reference_points: np.ndarray, 
+                type_weights: np.ndarray,
+                k: int,
+                batch_size: int = 20000
+            ) -> Tuple[np.ndarray, np.ndarray]:
+                """
+                GPU version of weighted KNN computation with batched processing of reference points
+                
+                Args:
+                    query_points: Query point coordinates (n_queries × n_dimensions)
+                    reference_points: Reference point coordinates (n_references × n_dimensions)
+                    type_weights: Weights for each dimension (n_queries x n_references)
+                    k: Number of nearest neighbors to find
+                    batch_size: Number of reference points to process in each batch
+                    
+                Returns:
+                    Tuple of (distances, indices) arrays
+                """
+                # Transfer query points and weights to GPU once
+                query_gpu = cp.asarray(query_points)
+                
+                n_queries = query_points.shape[0]
+                n_references = reference_points.shape[0]
+                k = min(k, n_references)
+                
+                # Initialize arrays to store final results
+                final_distances = cp.full((n_queries, k), cp.inf)
+                final_indices = cp.zeros((n_queries, k), dtype=np.int64)
+                
+                # Process reference points in batches
+                for batch_start in tqdm(range(0, n_references, batch_size)):
+                    batch_end = min(batch_start + batch_size, n_references)
+                    
+                    # Transfer current batch to GPU
+                    ref_batch_gpu = cp.asarray(reference_points[batch_start:batch_end])
+                    ref_weights_gpu = cp.asarray(type_weights[:, batch_start:batch_end])
+
+                    # Compute distances for current batch
+                    batch_dists = cp.zeros((n_queries, batch_end - batch_start))
+                    for i in range(query_gpu.shape[1]):
+                        diff = query_gpu[:, i:i+1] - ref_batch_gpu[:, i:i+1].T
+                        batch_dists += diff * diff
+                    
+                    # Apply type weights
+                    batch_dists /= (ref_weights_gpu + 1e-10)
+                    
+                    # Merge with existing results
+                    if batch_start == 0:
+                        # For first batch, simply get top k
+                        batch_indices = cp.argpartition(batch_dists, k, axis=1)[:, :k]
+                        row_indices = cp.arange(n_queries)[:, None]
+                        final_distances = batch_dists[row_indices, batch_indices]
+                        final_indices = batch_indices
+                    else:
+                        # For subsequent batches, merge with existing results
+                        combined_dists = cp.concatenate([final_distances, batch_dists], axis=1)
+                        combined_indices = cp.concatenate([
+                            final_indices,
+                            cp.arange(batch_start, batch_end)[None, :].repeat(n_queries, axis=0)
+                        ], axis=1)
+                        
+                        # Find top k among combined results
+                        top_k_indices = cp.argpartition(combined_dists, k, axis=1)[:, :k]
+                        final_distances = cp.take_along_axis(combined_dists, top_k_indices, axis=1)
+                        final_indices = cp.take_along_axis(combined_indices, top_k_indices, axis=1)
+                    
+                    # Sort within the k neighbors
+                    sort_indices = cp.argsort(final_distances, axis=1)
+                    final_distances = cp.take_along_axis(final_distances, sort_indices, axis=1)
+                    final_indices = cp.take_along_axis(final_indices, sort_indices, axis=1)
+                
+                # Transfer results back to CPU
+                return cp.asnumpy(final_distances), cp.asnumpy(final_indices)
+            
+            print("Using GPU to accelerate prior-KNN")
+            return parallel_weighted_knn_gpu_batched
+            
+        except Exception as e:
+            warnings.warn(f"GPU implementation failed: {str(e)}. Falling back to CPU version.")
+            return parallel_weighted_knn
+    else:
+        return parallel_weighted_knn
+
+# Function selector for RBF kernel computation
+def get_rbf_kernel_func(use_gpu: bool = None):
+
+    if use_gpu is None:
+        use_gpu = check_gpu_availability()
+    
+    if use_gpu:
+        try:
+            import cupy as cp
+            from cupyx.scipy.spatial.distance import cdist as cupy_cdist
+            
+            def fast_rbf_kernel_gpu(X: np.ndarray, 
+                                  Y: np.ndarray, 
+                                  gamma: float) -> np.ndarray:
+                """GPU version of RBF kernel computation"""
+                # Transfer data to GPU
+                X_gpu = cp.asarray(X)
+                Y_gpu = cp.asarray(Y)
+                
+                # Compute pairwise distances and kernel
+                K_gpu = cp.exp(-gamma * cupy_cdist(X_gpu, Y_gpu, metric='sqeuclidean'))
+                
+                # Transfer result back to CPU
+                K = cp.asnumpy(K_gpu)
+                
+                # Clean up GPU memory
+                del X_gpu, Y_gpu, K_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+                return K
+
+            print("Using GPU to accelerate RBF kernel")
+            return fast_rbf_kernel_gpu
+            
+        except Exception as e:
+            warnings.warn(f"GPU implementation failed: {str(e)}. Falling back to CPU version.")
+            return fast_rbf_kernel
+    else:
+        return fast_rbf_kernel
 
 def compute_center_vectors(datasets, cell_types):
     center_vectors = []
@@ -185,7 +347,7 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
               verbose=VERBOSE, ds_names=None, dimred=DIMRED, approx=APPROX, search_factor=SEARCH_FACTOR,
               sigma=SIGMA, alpha=ALPHA, knn=KNN, union=False, hvg=None, seed=0,
               sketch=False, sketch_method='geosketch', sketch_max=10000,
-              type_similarity_matrix=None, batch_key=Optional[str]):
+              type_similarity_matrix=None, use_gpu=False, batch_key=Optional[str]):
     """Integrate a list of data sets.
 
     Parameters
@@ -228,6 +390,8 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
         If a dataset has more cells than `sketch_max`, downsample to
         `sketch_max` using the method provided in `sketch_method`. Only used
         if `sketch=True`.
+    use_gpu: `bool`, optional (default: False)
+        Use gpu to accelerate computation
 
     Returns
     -------
@@ -238,6 +402,17 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
     """
     np.random.seed(seed)
     random.seed(seed)
+
+    print(f"Using Batch size {batch_size}. If MemoryOut, try to lower using --batch_size")
+    if use_gpu:
+        use_gpu = check_gpu_availability()
+        if use_gpu == False:
+            print("No available GPU, falling back to CPU")
+    
+    # Get appropriate function implementations
+    global rbf_kernel_func, weighted_knn_func
+    rbf_kernel_func = get_rbf_kernel_func(use_gpu)
+    weighted_knn_func = get_weighted_knn_func(use_gpu)
 
     if len(datasets_full) != len(cell_types_list):
         raise ValueError("Number of datasets must match number of cell type lists")
@@ -255,7 +430,7 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
     else:
         type_to_index = {t: i for i, t in enumerate(type_similarity_matrix.index)}
         cell_types = [np.array(list(map(lambda x: type_to_index[x], types))) for types in cell_types_list]
-        type_similarity_matrix = type_similarity_matrix.to_numpy()
+        type_similarity_matrix = type_similarity_matrix.to_numpy().astype(np.float32)
 
     datasets_dimred, genes = process_data(datasets, genes, hvg=hvg,
                                         dimred=dimred)
@@ -489,7 +664,7 @@ def check_datasets(datasets_full):
 
 # Randomized SVD.
 def dimensionality_reduce(datasets, dimred=DIMRED):
-    X = vstack(datasets)
+    X = vstack(datasets).astype(np.float32)
     X = reduce_dimensionality(X, dim_red_k=dimred)
     datasets_dimred = []
     base = 0
@@ -672,102 +847,61 @@ def process_batch(batch_data: Tuple[np.ndarray, np.ndarray, int],
                 
     return batch_matches
 
-def build_searcher(label_data, knn, metric_p):
-   """
-   Helper function to build a NearestNeighbors searcher
-   
-   Args:
-       label_data: Tuple of (label_idx, points)
-       knn: Number of neighbors
-       metric_p: Distance metric parameter
-   """
-   label_idx, points = label_data
-   if len(points) > 0:
-       nn_ = NearestNeighbors(n_neighbors=min(knn, len(points)), 
-                             p=metric_p,
-                             algorithm='ball_tree')
-       nn_.fit(np.array(points))
-       return label_idx, nn_
-   return label_idx, None
+@njit(parallel=True, fastmath=True)
+def parallel_weighted_knn(query_points: np.ndarray,
+                         reference_points: np.ndarray,
+                         type_weights: np.ndarray,
+                         k: int) -> Tuple[np.ndarray, np.ndarray]:
 
-def nn_with_type(ds1: np.ndarray, 
-                         ds2: np.ndarray, 
-                         ds1_types: np.ndarray,
-                         ds2_types: np.ndarray,
-                         type_similarity_matrix: np.ndarray,
-                         knn: int = 5,
-                         metric_p: int = 2,
-                         threshold: float = 0.4,
-                         n_jobs: int = -1,
-                         batch_size: int = None) -> Set[Tuple[int, int]]:
-    """
-    Parallel implementation of label-aware KNN search
+    n_queries = query_points.shape[0]
+    n_references = reference_points.shape[0]
+    k = min(k, n_references)
     
-    Additional Args:
-        n_jobs: Number of processes to use (-1 for all available)
-        batch_size: Size of batches for parallel processing (None for auto)
-    """
-    # Handle n_jobs parameter
-    if n_jobs < 1:
-        n_jobs = max(1, cpu_count() + n_jobs) 
+    distances = np.zeros((n_queries, k))
+    indices = np.zeros((n_queries, k), dtype=np.int32)
     
-    # 1. Initialize searchers and indices
-    label_searchers = {}  
-    label_points = defaultdict(list)
-    label_indices = defaultdict(list)
+    for i in prange(n_queries):
+        dists = np.zeros(n_references)
+        for j in range(n_references):
+            dist = 0.0
+            for f in range(query_points.shape[1]):
+                diff = query_points[i, f] - reference_points[j, f]
+                dist += diff * diff
+            dists[j] = dist / (type_weights[i, j] + 1e-10)
+            
+        temp_indices = np.argsort(dists)[:k]
+        indices[i] = temp_indices
+        distances[i] = dists[temp_indices]
     
-    # Build indices mapping numeric labels to points
-    for i, (point, label_idx) in enumerate(zip(ds2, ds2_types)):
-        label_points[label_idx].append(point)
-        label_indices[label_idx].append(i)
+    return distances, indices
+
+def nn_with_type(ds1: np.ndarray,
+                          ds2: np.ndarray,
+                          ds1_types: np.ndarray,
+                          ds2_types: np.ndarray,
+                          type_similarity_matrix: np.ndarray,
+                          knn: int = 5,
+                          batch_size: int = 5000) -> Set[Tuple[int, int]]:
+    
+    time_start = time.time()
+    n_samples = ds1.shape[0]
+    matches = set()
+    
+    for start_idx in range(0, n_samples, batch_size):
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_ds1 = ds1[start_idx:end_idx]
+        batch_weights = type_similarity_matrix[ds1_types[start_idx:end_idx][:, None], ds2_types[None, :]]
         
-    # Parallel tree building
-    with Pool(processes=n_jobs) as pool:
-        # Prepare data for parallel processing
-        label_data = [(label_idx, np.array(points)) 
-                        for label_idx, points in label_points.items()]
+        distances, indices = weighted_knn_func(
+            batch_ds1, ds2, batch_weights, knn
+        )
         
-        # Create partial function with fixed parameters
-        build_searcher_partial = partial(build_searcher, 
-                                        knn=knn,
-                                        metric_p=metric_p)
-        
-        # Build trees in parallel
-        results = pool.map(build_searcher_partial, label_data)
-        
-        # Convert results to dictionary
-        label_searchers = {label_idx: searcher 
-                            for label_idx, searcher in results 
-                            if searcher is not None}
-                
-    # 2. Prepare batches for parallel processing
-    n_samples = len(ds1)
-    if batch_size is None:
-        # Aim for ~100 batches or batch_size=100, whichever gives larger batches
-        batch_size = max(100, math.ceil(n_samples / 100))
-    
-    batches = []
-    for i in range(0, n_samples, batch_size):
-        batch_points = ds1[i:i + batch_size]
-        batch_types = ds1_types[i:i + batch_size]
-        batches.append((batch_points, batch_types, i))
-    
-    # 3. Process batches in parallel
-    with Pool(processes=n_jobs) as pool:
-        process_func = partial(process_batch,
-                             ds2=ds2,
-                             ds2_types=ds2_types,
-                             type_similarity_matrix=type_similarity_matrix,
-                             label_searchers=label_searchers,
-                             label_indices=label_indices,
-                             knn=knn,
-                             threshold=threshold)
-        
-        results = pool.map(process_func, batches)
-    
-    # 4. Combine results
-    match = set().union(*results)
-    return match
+        for i, neighbor_indices in enumerate(indices):
+            for j in neighbor_indices:
+                matches.add((start_idx + i, int(j)))
+
+    print('Time for dataset: {:.2f}s'.format(time.time() - time_start)) 
+    return matches
 
 # Approximate nearest neighbors using locality sensitive hashing.
 def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
@@ -860,11 +994,10 @@ def plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind):
     plt.plot(x_list, y_list, 'b-', alpha=0.3)
     plt.show()
 
-
 # Populate a table (in place) that stores mutual nearest neighbors
 # between datasets.
 def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, 
-                        type_similarity_matrix, base_ds=0, knn=30, approx=True, 
+                        type_similarity_matrix, base_ds=0, knn=30, approx=True, batch_size=None,
                         search_factor=5):
     """Optimized version of fill_table using array operations instead of IntervalTree."""
     # Create concatenated reference dataset
@@ -876,11 +1009,11 @@ def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types,
     
     if approx:
         match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, 
-                                   type_similarity_matrix, knn=knn, 
+                                   type_similarity_matrix, knn=knn,
                                    search_factor=search_factor)
     else:
         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, 
-                            type_similarity_matrix, knn=knn)
+                            type_similarity_matrix, knn=knn, batch_size=batch_size)
 
     # Process matches in batches for memory efficiency
     matches_by_dataset = defaultdict(list)
@@ -899,43 +1032,12 @@ def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types,
         if (i, j) not in table:
             table[(i, j)] = set()
         table[(i, j)].update(matches)
-# def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types, type_similarity_matrix,
-#                base_ds=0, knn=KNN, approx=APPROX, search_factor=SEARCH_FACTOR):
-#     curr_ref = np.concatenate(datasets)
-#     ref_types = np.concatenate(datasets_types)
-#     if approx:
-#         match = nn_with_type_approx(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn, search_factor=search_factor)
-#     else:
-#         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, type_similarity_matrix=type_similarity_matrix, knn=knn)
-
-#     # Build interval tree.
-#     itree_ds_idx = IntervalTree()
-#     itree_pos_base = IntervalTree()
-#     pos = 0
-#     for j in range(len(datasets)):
-#         n_cells = datasets[j].shape[0]
-#         itree_ds_idx[pos:(pos + n_cells)] = base_ds + j
-#         itree_pos_base[pos:(pos + n_cells)] = pos
-#         pos += n_cells
-
-#     # Store all mutual nearest neighbors between datasets.
-#     for d, r in match:
-#         interval = itree_ds_idx[r]
-#         assert(len(interval) == 1)
-#         j = interval.pop().data
-#         interval = itree_pos_base[r]
-#         assert(len(interval) == 1)
-#         base = interval.pop().data
-#         if not (i, j) in table:
-#             table[(i, j)] = set()
-#         table[(i, j)].add((d, r - base))
-#         assert(r - base >= 0)
 
 gs_idxs = None
 
 # Fill table of alignment scores.
 def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE, search_factor=SEARCH_FACTOR,
-                          prenormalized=False):
+                          batch_size=None, prenormalized=False):
     if not prenormalized:
         datasets = [ normalize(ds, axis=1) for ds in datasets ]
 
@@ -943,10 +1045,10 @@ def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN,
     for i in range(len(datasets)):
         if len(datasets[:i]) > 0:
             fill_table(table, i, datasets[i], datasets[:i], cell_types[i], cell_types[:i],
-                       type_similarity_matrix, knn=knn, approx=approx, search_factor=search_factor)
+                       type_similarity_matrix, knn=knn, approx=approx, search_factor=search_factor, batch_size=batch_size)
         if len(datasets[i+1:]) > 0:
             fill_table(table, i, datasets[i], datasets[i+1:], cell_types[i], cell_types[i+1:],
-                       type_similarity_matrix, knn=knn, base_ds=i+1, approx=approx, search_factor=search_factor)
+                       type_similarity_matrix, knn=knn, base_ds=i+1, approx=approx, search_factor=search_factor, batch_size=batch_size)
     # Count all mutual nearest neighbors between datasets.
     matches = {}
     table1 = {}
@@ -979,11 +1081,11 @@ def find_alignments_table(datasets, cell_types, type_similarity_matrix, knn=KNN,
 
 # Find the matching pairs of cells between datasets.
 def find_alignments(datasets, cell_types, type_similarity_matrix, knn=KNN, approx=APPROX, verbose=VERBOSE, search_factor=SEARCH_FACTOR,
-                    alpha=ALPHA, prenormalized=False):
+                    alpha=ALPHA, batch_size=None, prenormalized=False):
     table1, _, matches = find_alignments_table(
         datasets, cell_types, type_similarity_matrix,
         knn=knn, approx=approx, verbose=verbose, search_factor=search_factor,
-        prenormalized=prenormalized,
+        batch_size=batch_size, prenormalized=prenormalized,
     )
 
     alignments = [ (i, j) for (i, j), val in reversed(
@@ -1035,10 +1137,39 @@ def connect(datasets, knn=KNN, approx=APPROX, alpha=ALPHA,
 
     return panoramas
 
+@njit(parallel=True, fastmath=True)
+def fast_rbf_kernel(X, Y, gamma):
+    n_samples_X = X.shape[0]
+    n_samples_Y = Y.shape[0]
+    K = np.zeros((n_samples_X, n_samples_Y))
+    
+    block_size = 1024
+    n_blocks_X = (n_samples_X + block_size - 1) // block_size
+    n_blocks_Y = (n_samples_Y + block_size - 1) // block_size
+    
+    for block_i in prange(n_blocks_X):
+        i_start = block_i * block_size
+        i_end = min(i_start + block_size, n_samples_X)
+        
+        for block_j in range(n_blocks_Y):
+            j_start = block_j * block_size
+            j_end = min(j_start + block_size, n_samples_Y)
+            
+            for i in range(i_start, i_end):
+                for j in range(j_start, j_end):
+                    dist = 0.0
+                    for k in range(X.shape[1]):
+                        diff = X[i, k] - Y[j, k]
+                        dist += diff * diff
+                    K[i, j] = np.exp(-gamma * dist)
+    return K
+
 # To reduce memory usage, split bias computation into batches.
 def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_similarity_matrix, sigma=SIGMA, batch_size=None, alpha=0.1):
+    
     if batch_size is None:
-        weights = rbf_kernel(curr_ds, match_ds, gamma=0.5*sigma)
+        weights = rbf_kernel_func(curr_ds, match_ds, gamma=0.5*sigma)
+        weights = np.asarray(weights)
         type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, :]]
         weights = weights * type_weights**2 # curr*match
         weights = normalize(weights, axis=1, norm='l1')
@@ -1052,7 +1183,7 @@ def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_simil
         batch_idx = range(
             base, min(base + batch_size, match_ds.shape[0])
         )
-        weights = rbf_kernel(curr_ds, match_ds[batch_idx, :],
+        weights = rbf_kernel_func(curr_ds, match_ds[batch_idx, :],
                              gamma=0.5*sigma)
         type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, batch_idx]]
         weights = weights * type_weights**2
@@ -1062,30 +1193,8 @@ def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_simil
 
     denom = handle_zeros_in_scale(denom, copy=False)
     avg_bias /= denom[:, np.newaxis]
-    # random perturbation to increase robustness
-    avg_bias *= (1+OVERBIAS)
-    avg_bias *= (1+np.random.normal(0, BIAS_SCALE, avg_bias.shape))
-    # avg_bias += np.random.normal(0, 0.1, avg_bias.shape)
-
-    # correction_strength = compute_correction_strength(cell_types, type_similarity_matrix)
-    # avg_bias *= correction_strength[:, np.newaxis]
 
     return avg_bias
-
-# def compute_correction_strength(cell_types, type_similarity_matrix):
-#     unique_types = np.unique(cell_types)
-#     type_stability = np.array([np.mean(type_similarity_matrix.loc[t, :]) for t in unique_types])
-#     type_to_stability = dict(zip(unique_types, type_stability))
-    
-#     correction_strength = np.array([type_to_stability[t] for t in cell_types])
-    
-#     # Normalize correction strength
-#     correction_strength = (correction_strength - np.min(correction_strength)) / (np.max(correction_strength) - np.min(correction_strength))
-    
-#     # Adjust the range of correction strength (e.g., from 0.5 to 1)
-#     correction_strength = 0.5 + 0.5 * correction_strength
-    
-#     return correction_strength
 
 # Compute nonlinear translation vectors between dataset
 # and a reference.
@@ -1112,7 +1221,7 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, curr_types, ref_types, curr_ce
         warnings.filterwarnings('error', category=RuntimeWarning)
         try:
             avg_bias = batch_bias(curr_ds, match_ds, center_adjusted_bias, curr_types, match_cell_types, type_similarity_matrix, 
-                                  sigma=sigma, batch_size=batch_size, alpha=alpha)  
+                                  sigma=sigma, batch_size=batch_size)  
         except RuntimeWarning:
             sys.stderr.write('WARNING: Oversmoothing detected, refusing to batch '
                              'correct, consider lowering sigma value.\n')
@@ -1144,7 +1253,7 @@ def assemble(datasets, cell_types, center_vectors, type_similarity_matrix, verbo
     if alignments is None and matches is None:
         alignments, matches = find_alignments(
             datasets, cell_types, type_similarity_matrix,
-            knn=knn, approx=approx, alpha=alpha, verbose=verbose, search_factor=search_factor
+            knn=knn, approx=approx, alpha=alpha, verbose=verbose, search_factor=search_factor, batch_size=batch_size
         )
 
     ds_assembled = {}
