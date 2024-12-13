@@ -81,6 +81,7 @@ def get_weighted_knn_func(use_gpu: bool = None):
     if use_gpu:
         try:
             import cupy as cp
+            from cupy.cuda import memory_hooks
             
             def parallel_weighted_knn_gpu_batched(
                 query_points: np.ndarray,
@@ -102,61 +103,75 @@ def get_weighted_knn_func(use_gpu: bool = None):
                 Returns:
                     Tuple of (distances, indices) arrays
                 """
-                # Transfer query points and weights to GPU once
-                query_gpu = cp.asarray(query_points)
-                
+
+                pool = cp.cuda.MemoryPool()
+                cp.cuda.set_allocator(pool.malloc)
+
                 n_queries = query_points.shape[0]
                 n_references = reference_points.shape[0]
                 k = min(k, n_references)
-                
+
+                # Transfer query points and weights to GPU once
+                query_gpu = cp.asarray(query_points, dtype=cp.float16)
+                query_norm = (query_gpu ** 2).sum(axis=1, keepdims=True)
+               
                 # Initialize arrays to store final results
-                final_distances = cp.full((n_queries, k), cp.inf)
-                final_indices = cp.zeros((n_queries, k), dtype=np.int64)
+                final_distances = cp.full((n_queries, k), cp.inf, dtype=cp.float16)
+                final_indices = cp.zeros((n_queries, k), dtype=np.int32)
                 
                 # Process reference points in batches
-                for batch_start in tqdm(range(0, n_references, batch_size)):
+                for batch_start in range(0, n_references, batch_size):
                     batch_end = min(batch_start + batch_size, n_references)
+                    batch_size_curr = batch_end - batch_start
                     
                     # Transfer current batch to GPU
-                    ref_batch_gpu = cp.asarray(reference_points[batch_start:batch_end])
-                    ref_weights_gpu = cp.asarray(type_weights[:, batch_start:batch_end])
+                    ref_batch_gpu = cp.asarray(reference_points[batch_start:batch_end], dtype=cp.float16)
+                    type_weights_gpu = cp.asarray(type_weights[:, batch_start:batch_end], dtype=cp.float16)
+                    
+                    ref_norm = (ref_batch_gpu ** 2).sum(axis=1)
 
                     # Compute distances for current batch
-                    batch_dists = cp.zeros((n_queries, batch_end - batch_start))
-                    for i in range(query_gpu.shape[1]):
-                        diff = query_gpu[:, i:i+1] - ref_batch_gpu[:, i:i+1].T
-                        batch_dists += diff * diff
+                    batch_dists = query_norm + ref_norm - 2 * cp.dot(query_gpu, ref_batch_gpu.T)
                     
                     # Apply type weights
-                    batch_dists /= (ref_weights_gpu + 1e-10)
+                    batch_dists /= (type_weights_gpu + cp.float16(1e-4))
                     
                     # Merge with existing results
                     if batch_start == 0:
                         # For first batch, simply get top k
-                        batch_indices = cp.argpartition(batch_dists, k, axis=1)[:, :k]
-                        row_indices = cp.arange(n_queries)[:, None]
-                        final_distances = batch_dists[row_indices, batch_indices]
-                        final_indices = batch_indices
+                        top_k_idx = cp.argpartition(batch_dists, k-1, axis=1)[:, :k]
+                        row_idx = cp.arange(n_queries, dtype=np.int32)[:, None]
+                        final_distances = batch_dists[row_idx, top_k_idx]
+                        final_indices = top_k_idx + batch_start
                     else:
                         # For subsequent batches, merge with existing results
-                        combined_dists = cp.concatenate([final_distances, batch_dists], axis=1)
-                        combined_indices = cp.concatenate([
+                        all_dists = cp.concatenate([final_distances, batch_dists], axis=1)
+                        all_indices = cp.concatenate([
                             final_indices,
-                            cp.arange(batch_start, batch_end)[None, :].repeat(n_queries, axis=0)
+                            cp.arange(batch_start, batch_end, dtype=np.int32)[None, :].repeat(n_queries, axis=0)
                         ], axis=1)
                         
                         # Find top k among combined results
-                        top_k_indices = cp.argpartition(combined_dists, k, axis=1)[:, :k]
-                        final_distances = cp.take_along_axis(combined_dists, top_k_indices, axis=1)
-                        final_indices = cp.take_along_axis(combined_indices, top_k_indices, axis=1)
+                        top_k_idx = cp.argpartition(all_dists, k-1, axis=1)[:, :k]
+                        row_idx = cp.arange(n_queries, dtype=np.int32)[:, None]
+                        final_distances = all_dists[row_idx, top_k_idx]
+                        final_indices = all_indices[row_idx, top_k_idx]
                     
                     # Sort within the k neighbors
-                    sort_indices = cp.argsort(final_distances, axis=1)
-                    final_distances = cp.take_along_axis(final_distances, sort_indices, axis=1)
-                    final_indices = cp.take_along_axis(final_indices, sort_indices, axis=1)
+                    sort_idx = cp.argsort(final_distances, axis=1)
+                    final_distances = final_distances[row_idx, sort_idx]
+                    final_indices = final_indices[row_idx, sort_idx]
                 
+                    del ref_batch_gpu, type_weights_gpu, batch_dists
+                    if batch_start > 0:
+                        del all_dists, all_indices
+
                 # Transfer results back to CPU
-                return cp.asnumpy(final_distances), cp.asnumpy(final_indices)
+                result = (cp.asnumpy(final_distances.astype(cp.float32)), cp.asnumpy(final_indices))
+                del final_distances, final_indices, query_gpu, query_norm
+                pool.free_all_blocks()
+                
+                return result
             
             print("Using GPU to accelerate prior-KNN")
             return parallel_weighted_knn_gpu_batched
@@ -178,34 +193,29 @@ def get_rbf_kernel_func(use_gpu: bool = None):
             import cupy as cp
             from cupyx.scipy.spatial.distance import cdist as cupy_cdist
             
-            def fast_rbf_kernel_gpu(X: np.ndarray, 
-                                  Y: np.ndarray, 
-                                  gamma: float) -> np.ndarray:
+            def fast_rbf_kernel_gpu(X: cp.ndarray,
+                                  Y: cp.ndarray, 
+                                  gamma: float) -> cp.ndarray:
                 """GPU version of RBF kernel computation"""
-                # Transfer data to GPU
-                X_gpu = cp.asarray(X)
-                Y_gpu = cp.asarray(Y)
-                
+
                 # Compute pairwise distances and kernel
-                K_gpu = cp.exp(-gamma * cupy_cdist(X_gpu, Y_gpu, metric='sqeuclidean'))
+                XX = cp.sum(X * X, axis=1, keepdims=True)
+                YY = cp.sum(Y * Y, axis=1, keepdims=True).T
+                cross = -2.0 * cp.dot(X, Y.T)
+                K_gpu = cp.exp(-cp.float16(gamma) * (XX + YY + cross))
                 
-                # Transfer result back to CPU
-                K = cp.asnumpy(K_gpu)
-                
-                # Clean up GPU memory
-                del X_gpu, Y_gpu, K_gpu
-                cp.get_default_memory_pool().free_all_blocks()
-                
-                return K
+                del XX, YY, cross
+
+                return K_gpu
 
             print("Using GPU to accelerate RBF kernel")
-            return fast_rbf_kernel_gpu
+            return fast_rbf_kernel_gpu, True
             
         except Exception as e:
             warnings.warn(f"GPU implementation failed: {str(e)}. Falling back to CPU version.")
-            return fast_rbf_kernel
+            return fast_rbf_kernel, False
     else:
-        return fast_rbf_kernel
+        return fast_rbf_kernel, False
 
 def compute_center_vectors(datasets, cell_types):
     center_vectors = []
@@ -410,8 +420,8 @@ def integrate(datasets_full, genes_list, cell_types_list, batch_size=BATCH_SIZE,
             print("No available GPU, falling back to CPU")
     
     # Get appropriate function implementations
-    global rbf_kernel_func, weighted_knn_func
-    rbf_kernel_func = get_rbf_kernel_func(use_gpu)
+    global rbf_kernel_func, weighted_knn_func, rbf_gpu_avail
+    rbf_kernel_func, rbf_gpu_avail = get_rbf_kernel_func(use_gpu)
     weighted_knn_func = get_weighted_knn_func(use_gpu)
 
     if len(datasets_full) != len(cell_types_list):
@@ -783,70 +793,6 @@ def weighted_distance_matrix(euclidean_dist, type_sim):
     weighted_dist = euclidean_dist / type_sim
     return weighted_dist
 
-def process_batch(batch_data: Tuple[np.ndarray, np.ndarray, int], 
-                 ds2: np.ndarray,
-                 ds2_types: np.ndarray,
-                 type_similarity_matrix: np.ndarray,
-                 label_searchers: Dict,
-                 label_indices: Dict,
-                 knn: int,
-                 threshold: float) -> Set[Tuple[int, int]]:
-    """
-    Process a batch of query points in parallel
-    
-    Args:
-        batch_data: Tuple of (batch_points, batch_types, start_idx)
-        Other args same as main function
-    """
-    batch_points, batch_types, start_idx = batch_data
-    batch_matches = set()
-    
-    for i, (query_point, query_label_idx) in enumerate(zip(batch_points, batch_types)):
-        # Get similarity scores for query label
-        label_similarities = type_similarity_matrix[query_label_idx]
-        similar_labels = np.where(label_similarities > threshold)[0]
-        
-        candidates = []
-        
-        # Search in each similar label group
-        for target_label_idx in similar_labels:
-            if target_label_idx not in label_searchers:
-                continue
-                
-            similarity = label_similarities[target_label_idx]
-            searcher = label_searchers[target_label_idx]
-            
-            dists, indices = searcher.kneighbors([query_point])
-            adjusted_dists = dists[0] / (similarity + 1e-6)
-            original_indices = [label_indices[target_label_idx][idx] for idx in indices[0]]
-            candidates.extend(zip(adjusted_dists, original_indices))
-            
-        # Adaptive threshold if not enough neighbors
-        if len(candidates) < knn:
-            threshold_temp = threshold / 2
-            while len(candidates) < knn and threshold_temp > 0.1:
-                additional_labels = np.where((label_similarities > threshold_temp) & 
-                                          (label_similarities <= threshold))[0]
-                
-                for target_label_idx in additional_labels:
-                    if target_label_idx not in label_searchers:
-                        continue
-                    similarity = label_similarities[target_label_idx]
-                    searcher = label_searchers[target_label_idx]
-                    dists, indices = searcher.kneighbors([query_point])
-                    adjusted_dists = dists[0] / similarity
-                    original_indices = [label_indices[target_label_idx][idx] for idx in indices[0]]
-                    candidates.extend(zip(adjusted_dists, original_indices))
-                threshold_temp /= 2
-                
-        # Add top k to matches
-        if candidates:
-            candidates.sort()
-            for _, idx in candidates[:knn]:
-                batch_matches.add((start_idx + i, idx))
-                
-    return batch_matches
-
 @njit(parallel=True, fastmath=True)
 def parallel_weighted_knn(query_points: np.ndarray,
                          reference_points: np.ndarray,
@@ -887,7 +833,7 @@ def nn_with_type(ds1: np.ndarray,
     n_samples = ds1.shape[0]
     matches = set()
     
-    for start_idx in range(0, n_samples, batch_size):
+    for start_idx in tqdm(range(0, n_samples, batch_size)):
         end_idx = min(start_idx + batch_size, n_samples)
         batch_ds1 = ds1[start_idx:end_idx]
         batch_weights = type_similarity_matrix[ds1_types[start_idx:end_idx][:, None], ds2_types[None, :]]
@@ -900,7 +846,6 @@ def nn_with_type(ds1: np.ndarray,
             for j in neighbor_indices:
                 matches.add((start_idx + i, int(j)))
 
-    print('Time for dataset: {:.2f}s'.format(time.time() - time_start)) 
     return matches
 
 # Approximate nearest neighbors using locality sensitive hashing.
@@ -1012,6 +957,7 @@ def fill_table(table, i, curr_ds, datasets, curr_types, datasets_types,
                                    type_similarity_matrix, knn=knn,
                                    search_factor=search_factor)
     else:
+        print(f"Constructing dataset {i} kNN") 
         match = nn_with_type(curr_ds, curr_ref, curr_types, ref_types, 
                             type_similarity_matrix, knn=knn, batch_size=batch_size)
 
@@ -1176,25 +1122,72 @@ def batch_bias(curr_ds, match_ds, bias, curr_types, match_cell_types, type_simil
         avg_bias = np.dot(weights, bias)
         return avg_bias
 
-    base = 0
-    avg_bias = np.zeros(curr_ds.shape)
-    denom = np.zeros(curr_ds.shape[0])
-    while base < match_ds.shape[0]:
-        batch_idx = range(
-            base, min(base + batch_size, match_ds.shape[0])
-        )
-        weights = rbf_kernel_func(curr_ds, match_ds[batch_idx, :],
-                             gamma=0.5*sigma)
-        type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, batch_idx]]
-        weights = weights * type_weights**2
-        avg_bias += np.dot(weights, bias[batch_idx, :])
-        denom += np.sum(weights, axis=1)
-        base += batch_size
+    if rbf_gpu_avail: # use gpu version
+        import cupy as cp
 
-    denom = handle_zeros_in_scale(denom, copy=False)
-    avg_bias /= denom[:, np.newaxis]
+        pool = cp.cuda.MemoryPool()
+        cp.cuda.set_allocator(pool.malloc)
 
-    return avg_bias
+        with cp.cuda.Device(0):
+            curr_gpu = cp.asarray(curr_ds, dtype=cp.float32)
+            type_sim_gpu = cp.asarray(type_similarity_matrix, dtype=cp.float32)
+            
+            n_samples = curr_ds.shape[0]
+            avg_bias_gpu = cp.zeros_like(curr_gpu, dtype=cp.float32)
+            denom_gpu = cp.zeros(n_samples, dtype=cp.float32)
+            
+            for batch_start in range(0, match_ds.shape[0], batch_size):
+                batch_end = min(batch_start + batch_size, match_ds.shape[0])
+                
+                match_batch_gpu = cp.asarray(match_ds[batch_start:batch_end], dtype=cp.float32)
+                bias_batch_gpu = cp.asarray(bias[batch_start:batch_end], dtype=cp.float32)
+                
+                weights = rbf_kernel_func(curr_gpu, match_batch_gpu, gamma=0.5*sigma)
+                
+                cell_types_batch = match_cell_types[batch_start:batch_end]
+                type_weights = type_sim_gpu[curr_types[:, None], cell_types_batch[None, :]]
+                assert isinstance(weights, cp.ndarray)
+                assert isinstance(type_weights, cp.ndarray)
+
+                weights = weights * type_weights**2
+                
+                avg_bias_gpu += cp.dot(weights, bias_batch_gpu)
+                denom_gpu += weights.sum(axis=1)
+                
+                del match_batch_gpu, bias_batch_gpu, weights, type_weights
+            
+            denom_gpu = denom_gpu + cp.float32(1e-8)
+            avg_bias_gpu /= denom_gpu[:, None]
+            
+            result = cp.asnumpy(avg_bias_gpu)
+            
+            del avg_bias_gpu, denom_gpu
+
+            pool.free_all_blocks()
+            cp.cuda.runtime.deviceSynchronize()
+
+            return result
+        
+    else:
+        base = 0
+        avg_bias = np.zeros(curr_ds.shape)
+        denom = np.zeros(curr_ds.shape[0])
+        while base < match_ds.shape[0]:
+            batch_idx = range(
+                base, min(base + batch_size, match_ds.shape[0])
+            )
+            weights = rbf_kernel_func(curr_ds, match_ds[batch_idx, :],
+                                gamma=0.5*sigma)
+            type_weights = type_similarity_matrix[curr_types[:, None], match_cell_types[None, batch_idx]]
+            weights = weights * type_weights**2
+            avg_bias += np.dot(weights, bias[batch_idx, :])
+            denom += np.sum(weights, axis=1)
+            base += batch_size
+
+        denom = handle_zeros_in_scale(denom, copy=False)
+        avg_bias /= denom[:, np.newaxis]
+
+        return avg_bias
 
 # Compute nonlinear translation vectors between dataset
 # and a reference.
@@ -1438,6 +1431,7 @@ def assemble(datasets, cell_types, center_vectors, type_similarity_matrix, verbo
         if view_match:
             plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind)
 
+    datasets = [np.asarray(ds) for ds in datasets]
     return datasets
 
 # Sketch-based acceleration of integration.
