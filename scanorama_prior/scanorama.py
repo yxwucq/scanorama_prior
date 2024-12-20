@@ -59,6 +59,7 @@ def check_gpu_availability() -> bool:
         
         # Check if CUDA is available
         if not cuda.is_available():
+            print('cuda is_available check false')
             return False
             
         # Try to initialize CUDA device
@@ -69,7 +70,8 @@ def check_gpu_availability() -> bool:
         test_array + test_array
         
         return True
-    except:
+    except Exception as e:
+        print(e)
         return False
 
 # Function selector for weighted KNN computation
@@ -134,7 +136,7 @@ def get_weighted_knn_func(use_gpu: bool = None):
                     batch_dists = query_norm + ref_norm - 2 * cp.dot(query_gpu, ref_batch_gpu.T)
                     
                     # Apply type weights
-                    batch_dists /= (type_weights_gpu + cp.float16(1e-4))
+                    batch_dists /= (type_weights_gpu + cp.float16(1e-8))
                     
                     # Merge with existing results
                     if batch_start == 0:
@@ -202,7 +204,7 @@ def get_rbf_kernel_func(use_gpu: bool = None):
                 XX = cp.sum(X * X, axis=1, keepdims=True)
                 YY = cp.sum(Y * Y, axis=1, keepdims=True).T
                 cross = -2.0 * cp.dot(X, Y.T)
-                K_gpu = cp.exp(-cp.float16(gamma) * (XX + YY + cross))
+                K_gpu = cp.exp(-cp.float32(gamma) * (XX + YY + cross))
                 
                 del XX, YY, cross
 
